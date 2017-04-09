@@ -21,16 +21,18 @@
 (defvar *free-variables*)
 (defvar *environment*)
 (defvar *lambda-parents*)
+(defvar *current-closure-set*)
 
 (defun lower-environment (lambda)
   (let ((*environment-layout* (make-hash-table))
         (*environment-layout-dx* (make-hash-table))
         (*allow-dx-environment* 't)
         (*current-lambda* nil)
-        (*lambda-parents* (make-hash-table)))
+        (*lambda-parents* (make-hash-table))
+        (*free-variables* (compute-free-variable-sets lambda))
+        (*current-closure-set* '()))
     (compute-environment-layout lambda)
-    (let ((*free-variables* (compute-free-variable-sets lambda))
-          (*environment* '()))
+    (let ((*environment* '()))
       (lower-env-form lambda))))
 
 (defun quoted-form-p (form)
@@ -93,12 +95,15 @@ of statements opens a new contour."
   (maybe-add-environment-variable (info form))
   (let ((env-is-dx t))
     (let ((*active-environment-vector* (info form))
-          (*allow-dx-environment* t))
-      (loop for (go-tag stmt) in (statements form) do
+          (*allow-dx-environment* t)
+          (*current-closure-set* '()))
+      (loop
+         for (go-tag stmt) in (statements form) do
            (unless (finalize-environment-layout *active-environment-vector*)
              (setf env-is-dx nil))
            (setf *active-environment-vector* go-tag
-                 *allow-dx-environment* t)
+                 *allow-dx-environment* t
+                 *current-closure-set* '())
            (compute-environment-layout stmt))
       (unless (finalize-environment-layout *active-environment-vector*)
         (setf env-is-dx nil)))
@@ -116,7 +121,7 @@ of statements opens a new contour."
   (compute-environment-layout (cleanup-function form)))
 
 (defmethod compute-environment-layout ((form ast-call))
-  (cond ((and (eql (name form) 'funcall)
+  (cond ((and (eql (name form) 'mezzano.runtime::%funcall)
               (lambda-information-p (first (arguments form))))
          (unless (getf (lambda-information-plist (first (arguments form))) 'extent)
            (setf (getf (lambda-information-plist (first (arguments form))) 'extent) :dynamic))
@@ -140,24 +145,29 @@ of statements opens a new contour."
              (not (localp variable)))
     (push variable (gethash *active-environment-vector* *environment-layout*))))
 
+(defun lambda-is-dynamic-extent-p (lambda)
+  (or (eql (getf (lambda-information-plist lambda) 'extent) :dynamic)
+      (getf (lambda-information-plist lambda) 'declared-dynamic-extent)))
+
 (defun lambda-tree-is-dynamic-extent-p (lambda end)
   (cond ((eql lambda end)
          t)
         (t
-         (and (or (eql (getf (lambda-information-plist lambda) 'extent) :dynamic)
-                  (getf (lambda-information-plist lambda) 'declared-dynamic-extent))
+         (and (lambda-is-dynamic-extent-p lambda)
               (lambda-tree-is-dynamic-extent-p (gethash lambda *lambda-parents*) end)))))
 
 (defun finalize-environment-layout (env)
-  ;; Inner environments must be DX, and every variable in this environment
-  ;; must only be accessed by DX lambdas.
+  ;; Inner environments must be DX, and every variable (including the parent
+  ;; backlink) in this environment must only be accessed by DX lambdas.
   (when (and *allow-dx-environment*
+             (not *perform-tce*)
              (every (lambda (var)
                       (every (lambda (l)
                                (or (eql (lexical-variable-definition-point var) l)
                                    (lambda-tree-is-dynamic-extent-p l *current-lambda*)))
                              (lexical-variable-used-in var)))
-                    (gethash env *environment-layout*)))
+                    (gethash env *environment-layout*))
+             (every #'lambda-is-dynamic-extent-p *current-closure-set*))
     (setf (gethash env *environment-layout-dx*) t)
     t))
 
@@ -173,6 +183,12 @@ Keyword arguments, non-constant init-forms and special variables are disallowed.
          (assert (lexical-variable-p suppliedp))))
   (when (lambda-information-rest-arg lambda)
     (assert (lexical-variable-p (lambda-information-rest-arg lambda))))
+  (when (lambda-information-fref-arg lambda)
+    (assert (lexical-variable-p (lambda-information-fref-arg lambda))))
+  (when (lambda-information-closure-arg lambda)
+    (assert (lexical-variable-p (lambda-information-closure-arg lambda))))
+  (when (lambda-information-count-arg lambda)
+    (assert (lexical-variable-p (lambda-information-count-arg lambda))))
   (assert (not (lambda-information-enable-keys lambda))))
 
 (defun compute-lambda-environment-layout (lambda)
@@ -180,7 +196,8 @@ Keyword arguments, non-constant init-forms and special variables are disallowed.
     (setf (gethash lambda *lambda-parents*) *current-lambda*)
     (let ((*active-environment-vector* lambda)
           (*allow-dx-environment* t)
-          (*current-lambda* lambda))
+          (*current-lambda* lambda)
+          (*current-closure-set* '()))
       (assert (null (lambda-information-environment-arg lambda)))
       (check-simple-lambda-parameters lambda)
       (dolist (arg (lambda-information-required-args lambda))
@@ -191,8 +208,16 @@ Keyword arguments, non-constant init-forms and special variables are disallowed.
           (maybe-add-environment-variable (third arg))))
       (when (lambda-information-rest-arg lambda)
         (maybe-add-environment-variable (lambda-information-rest-arg lambda)))
+      (when (lambda-information-fref-arg lambda)
+        (maybe-add-environment-variable (lambda-information-fref-arg lambda)))
+      (when (lambda-information-closure-arg lambda)
+        (maybe-add-environment-variable (lambda-information-closure-arg lambda)))
+      (when (lambda-information-count-arg lambda)
+        (maybe-add-environment-variable (lambda-information-count-arg lambda)))
       (compute-environment-layout (lambda-information-body lambda))
       (setf env-is-dx (finalize-environment-layout lambda)))
+    (when (gethash lambda *free-variables*)
+      (push lambda *current-closure-set*))
     (unless env-is-dx
       (setf *allow-dx-environment* nil))))
 
@@ -286,7 +311,13 @@ Keyword arguments, non-constant init-forms and special variables are disallowed.
                        (when (lambda-information-rest-arg form)
                          (list (lambda-information-rest-arg form)))
                        (when (lambda-information-environment-arg form)
-                         (list (lambda-information-environment-arg form)))))
+                         (list (lambda-information-environment-arg form)))
+                       (when (lambda-information-fref-arg form)
+                         (list (lambda-information-fref-arg form)))
+                       (when (lambda-information-closure-arg form)
+                         (list (lambda-information-closure-arg form)))
+                       (when (lambda-information-count-arg form)
+                         (list (lambda-information-count-arg form)))))
          (vars (set-difference (union (compute-free-variable-sets-form-list initforms)
                                       (compute-free-variable-sets-1 (lambda-information-body form)))
                                defs)))
@@ -305,7 +336,8 @@ Keyword arguments, non-constant init-forms and special variables are disallowed.
                         (block-information-env-offset (info form)) env-offset)
                   (list
                    `(call (setf sys.int::%object-ref-t) ,(info form) ,env-var (quote ,env-offset)))))
-            ,(lower-env-form (body form))))))
+            ,(lower-env-form (body form))))
+       form))
 
 (defmethod lower-env-form ((form ast-function))
   form)
@@ -330,7 +362,8 @@ Keyword arguments, non-constant init-forms and special variables are disallowed.
                                       (ast `(call (setf sys.int::%object-ref-t)
                                                   ,(lower-env-form init-form)
                                                   ,(second (first *environment-chain*))
-                                                  (quote ,(1+ (position variable (gethash (first *environment*) *environment-layout*))))))))))
+                                                  (quote ,(1+ (position variable (gethash (first *environment*) *environment-layout*)))))
+                                           form)))))
   (setf (body form) (lower-env-form (body form)))
   form)
 
@@ -346,20 +379,24 @@ Keyword arguments, non-constant init-forms and special variables are disallowed.
                                        ,(second (first *environment-chain*))
                                        (quote ,(1+ (position var (gethash (first *environment*) *environment-layout*))))))))
                       (bindings form))
-            ,(lower-env-form (body form))))))
+            ,(lower-env-form (body form))))
+       form))
 
 (defmethod lower-env-form ((form ast-multiple-value-call))
   (ast `(multiple-value-call
             ,(lower-env-form (function-form form))
-          ,(lower-env-form (value-form form)))))
+          ,(lower-env-form (value-form form)))
+       form))
 
 (defmethod lower-env-form ((form ast-multiple-value-prog1))
   (ast `(multiple-value-prog1
             ,(lower-env-form (value-form form))
-          ,(lower-env-form (body form)))))
+          ,(lower-env-form (body form)))
+       form))
 
 (defmethod lower-env-form ((form ast-progn))
-  (ast `(progn ,@(mapcar #'lower-env-form (forms form)))))
+  (ast `(progn ,@(mapcar #'lower-env-form (forms form)))
+       form))
 
 (defmethod lower-env-form ((form ast-quote))
   form)
@@ -381,7 +418,8 @@ Keyword arguments, non-constant init-forms and special variables are disallowed.
                  (return (ast `(call (setf sys.int::%object-ref-t)
                                      ,(lower-env-form (value form))
                                      ,(get-env-vector e)
-                                     (quote ,(1+ offset)))))))))))
+                                     (quote ,(1+ offset)))
+                              form))))))))
 
 (defmethod lower-env-form ((form ast-tagbody))
   (let* ((possible-env-vector-heads (list* (info form)
@@ -391,6 +429,7 @@ Keyword arguments, non-constant init-forms and special variables are disallowed.
          (new-envs (loop for i in env-vector-heads
                       collect (list i
                                     (make-instance 'lexical-variable
+                                                   :inherit form
                                                    :name (gensym "Environment")
                                                    :definition-point *current-lambda*
                                                    :plist (list 'hide-from-debug-info t))
@@ -424,9 +463,11 @@ Keyword arguments, non-constant init-forms and special variables are disallowed.
                                                     (list `(setq ,(second info)
                                                                  ,(generate-make-environment (info form) (1+ (length (third info)))))))))
                                        (go ,old-entry ,(info form))))
-                              ,@new-statements))
+                              ,@new-statements)
+                          form)
                      (ast `(tagbody ,(info form)
-                              ,@new-statements)))))
+                              ,@new-statements)
+                          form))))
              (frob-inner (current-env)
                (loop
                   for (go-tag stmt) in (statements form)
@@ -447,13 +488,15 @@ Keyword arguments, non-constant init-forms and special variables are disallowed.
                                                                                  *environment-chain*))
                                                      (*environment* (list* current-env *environment*)))
                                                  (lower-env-form stmt))
-                                               (lower-env-form stmt)))))))))
+                                               (lower-env-form stmt)))
+                                       stmt))))))
       (if (endp new-envs)
           (frob-outer)
           (ast `(let ,(loop
                          for (stmt env layout) in new-envs
                          collect (list env (ast `(quote nil))))
-                  ,(frob-outer)))))))
+                  ,(frob-outer))
+               form)))))
 
 (defmethod lower-env-form ((form ast-the))
   (setf (value form) (lower-env-form (value form)))
@@ -462,17 +505,20 @@ Keyword arguments, non-constant init-forms and special variables are disallowed.
 (defmethod lower-env-form ((form ast-unwind-protect))
   (ast `(unwind-protect
              ,(lower-env-form (protected-form form))
-          ,(lower-env-form (cleanup-function form)))))
+          ,(lower-env-form (cleanup-function form)))
+       form))
 
 (defmethod lower-env-form ((form ast-call))
   (ast `(call
          ,(name form)
-         ,@(mapcar #'lower-env-form (arguments form)))))
+         ,@(mapcar #'lower-env-form (arguments form)))
+       form))
 
 (defmethod lower-env-form ((form ast-jump-table))
   (ast `(jump-table
          ,(lower-env-form (value form))
-         ,@(mapcar #'lower-env-form (targets form)))))
+         ,@(mapcar #'lower-env-form (targets form)))
+       form))
 
 (defmethod lower-env-form ((form lexical-variable))
   (if (localp form)
@@ -484,7 +530,8 @@ Keyword arguments, non-constant init-forms and special variables are disallowed.
           (when offset
             (return (ast `(call sys.int::%object-ref-t
                                 ,(get-env-vector e)
-                                (quote ,(1+ offset))))))))))
+                                (quote ,(1+ offset)))
+                         form)))))))
 
 (defun lower-env-lambda (lambda)
   (let ((*environment-chain* '())
@@ -499,6 +546,7 @@ Keyword arguments, non-constant init-forms and special variables are disallowed.
     (when *environment*
       ;; The entry environment vector.
       (let ((env (make-instance 'lexical-variable
+                                :inherit lambda
                                 :name (gensym "Environment")
                                 :definition-point lambda
                                 :plist (list 'hide-from-debug-info t))))
@@ -507,6 +555,7 @@ Keyword arguments, non-constant init-forms and special variables are disallowed.
     (cond ((not (endp local-env))
            ;; Environment is present, rewrite body with a new vector.
            (let ((new-env (make-instance 'lexical-variable
+                                         :inherit lambda
                                          :name (gensym "Environment")
                                          :definition-point lambda
                                          :plist (list 'hide-from-debug-info t))))
@@ -541,7 +590,17 @@ Keyword arguments, non-constant init-forms and special variables are disallowed.
                                ,@(when (and (lambda-information-rest-arg lambda)
                                             (not (localp (lambda-information-rest-arg lambda))))
                                        (list (set-var (lambda-information-rest-arg lambda))))
-                               ,(lower-env-form (lambda-information-body lambda)))))))))
+                               ,@(when (and (lambda-information-fref-arg lambda)
+                                            (not (localp (lambda-information-fref-arg lambda))))
+                                       (list (set-var (lambda-information-fref-arg lambda))))
+                               ,@(when (and (lambda-information-closure-arg lambda)
+                                            (not (localp (lambda-information-closure-arg lambda))))
+                                       (list (set-var (lambda-information-closure-arg lambda))))
+                               ,@(when (and (lambda-information-count-arg lambda)
+                                            (not (localp (lambda-information-count-arg lambda))))
+                                       (list (set-var (lambda-information-count-arg lambda))))
+                               ,(lower-env-form (lambda-information-body lambda))))
+                          lambda)))))
           (t (setf (lambda-information-environment-layout lambda) (compute-environment-layout-debug-info))
              (setf (lambda-information-body lambda) (lower-env-form (lambda-information-body lambda)))))
     lambda))
@@ -551,18 +610,22 @@ Keyword arguments, non-constant init-forms and special variables are disallowed.
              (endp (gethash form *free-variables*)))
          (let ((*environment* '()))
            (lower-env-lambda form)))
-        ((getf (lambda-information-plist form) 'declared-dynamic-extent)
+        ((and (getf (lambda-information-plist form) 'declared-dynamic-extent)
+              (not *perform-tce*))
          (ast `(call sys.c::make-dx-closure
                      ,(lower-env-lambda form)
-                     ,(second (first *environment-chain*)))))
+                     ,(second (first *environment-chain*)))
+              form))
         (*environment-allocation-mode*
          (ast `(call sys.int::make-closure
                      ,(lower-env-lambda form)
                      ,(second (first *environment-chain*))
-                     (quote ,*environment-allocation-mode*))))
+                     (quote ,*environment-allocation-mode*))
+              form))
         (t (ast `(call sys.int::make-closure
                        ,(lower-env-lambda form)
-                       ,(second (first *environment-chain*)))))))
+                       ,(second (first *environment-chain*)))
+                form))))
 
 (defvar *environment-chain* nil
   "The directly accessible environment vectors in this function.")
@@ -587,7 +650,8 @@ Keyword arguments, non-constant init-forms and special variables are disallowed.
               ;; Allocation in an explicit area.
               `(call sys.int::make-simple-vector (quote ,size) (quote ,*environment-allocation-mode*)))
              (t ;; General allocation.
-              `(call sys.int::make-simple-vector (quote ,size))))))
+              `(call sys.int::make-simple-vector (quote ,size))))
+       lambda))
 
 (defun get-env-vector (vector-id)
   (let ((chain (assoc vector-id *environment-chain*)))

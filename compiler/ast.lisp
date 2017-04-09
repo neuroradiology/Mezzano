@@ -5,7 +5,19 @@
 
 ;;; AST objects.
 
-(defclass lambda-information ()
+(defclass ast-node ()
+  ((%optimize-qualities :initarg :optimize :accessor ast-optimize))
+  (:default-initargs :optimize '()))
+
+(defmethod initialize-instance :after ((instance ast-node) &key inherit &allow-other-keys)
+  (when inherit
+    (loop
+       for (quality value) on (ast-optimize inherit) by #'cddr
+       do (setf (getf (ast-optimize instance) quality)
+                (max value
+                     (getf (ast-optimize instance) quality 0))))))
+
+(defclass lambda-information (ast-node)
   ((%name :initarg :name :accessor lambda-information-name)
    (%docstring :initarg :docstring :accessor lambda-information-docstring)
    (%lambda-list :initarg :lambda-list :accessor lambda-information-lambda-list)
@@ -18,6 +30,9 @@
    (%allow-other-keys :initarg :allow-other-keys :accessor lambda-information-allow-other-keys)
    (%environment-arg :initarg :environment-arg :accessor lambda-information-environment-arg)
    (%environment-layout :initarg :environment-layout :accessor lambda-information-environment-layout)
+   (%fref-arg :initarg :fref-arg :accessor lambda-information-fref-arg)
+   (%closure-arg :initarg :closure-arg :accessor lambda-information-closure-arg)
+   (%count-arg :initarg :count-arg :accessor lambda-information-count-arg)
    (%plist :initarg :plist :accessor lambda-information-plist))
   (:default-initargs :name nil
                      :docstring nil
@@ -31,13 +46,16 @@
                      :allow-other-keys '()
                      :environment-arg nil
                      :environment-layout nil
+                     :fref-arg nil
+                     :closure-arg nil
+                     :count-arg nil
                      :plist '()))
 
 (defun lambda-information-p (object)
   (typep object 'lambda-information))
 
 ;;; A lexical-variable represents a "renamed" variable, and stores definition information.
-(defclass lexical-variable ()
+(defclass lexical-variable (ast-node)
   ((%name :initarg :name :accessor lexical-variable-name)
    (%definition-point :initarg :definition-point :accessor lexical-variable-definition-point)
    (%ignore :initarg :ignore :accessor lexical-variable-ignore)
@@ -55,6 +73,9 @@
                      :used-in '()
                      :plist '()))
 
+(defmethod name ((object lexical-variable))
+  (lexical-variable-name object))
+
 (defun lexical-variable-p (object)
   (typep object 'lexical-variable))
 
@@ -62,9 +83,16 @@
   (print-unreadable-object (object stream :type t :identity t)
     (format stream "~S" (lexical-variable-name object))))
 
+(defun localp (var)
+  (or (null (lexical-variable-used-in var))
+      (and (null (cdr (lexical-variable-used-in var)))
+           (eq (car (lexical-variable-used-in var)) (lexical-variable-definition-point var)))))
+
 ;;; A special variable, only used in bindings.
-(defclass special-variable ()
-  ((%name :initarg :name :accessor name)))
+(defclass special-variable (ast-node)
+  ((%name :initarg :name :accessor name)
+   (%implicitly-declared :initarg :implicitly-declared :accessor special-variable-implicitly-declared))
+  (:default-initargs :implicitly-declared nil))
 
 (defmethod print-object ((object special-variable) stream)
   (print-unreadable-object (object stream :type t :identity t)
@@ -94,7 +122,7 @@
 (defun tagbody-information-p (object)
   (typep object 'tagbody-information))
 
-(defclass go-tag ()
+(defclass go-tag (ast-node)
   ((%name :initarg :name :accessor go-tag-name)
    (%tagbody :initarg :tagbody :accessor go-tag-tagbody)
    (%use-count :initarg :use-count :accessor go-tag-use-count)
@@ -107,98 +135,102 @@
 (defun go-tag-p (object)
   (typep object 'go-tag))
 
-(defclass ast-block ()
-  ((%info :initarg :info :accessor info)
-   (%body :initarg :body :accessor body)))
+(defclass ast-block (ast-node)
+  ((%info :initarg :info :accessor info :accessor ast-info)
+   (%body :initarg :body :accessor body :accessor ast-body)))
 
-(defclass ast-function ()
-  ((%name :initarg :name :accessor name)))
+(defclass ast-function (ast-node)
+  ((%name :initarg :name :accessor name :accessor ast-name)))
 
 (defmethod print-object ((object ast-function) stream)
   (print-unreadable-object (object stream :type t :identity t)
     (format stream "~S" (name object))))
 
-(defclass ast-go ()
-  ((%target :initarg :target :accessor target)
-   (%info :initarg :info :accessor info)))
+(defclass ast-go (ast-node)
+  ((%target :initarg :target :accessor target :accessor ast-target)
+   (%info :initarg :info :accessor info :accessor ast-info)))
 
-(defclass ast-if ()
-  ((%test :initarg :test :accessor test)
-   (%then :initarg :then :accessor if-then)
-   (%else :initarg :else :accessor if-else)))
+(defclass ast-if (ast-node)
+  ((%test :initarg :test :accessor test :accessor ast-test)
+   (%then :initarg :then :accessor if-then :accessor ast-if-then)
+   (%else :initarg :else :accessor if-else :accessor ast-if-else)))
 
-(defclass ast-let ()
+(defclass ast-let (ast-node)
   ;; BINDINGS is a list of (variable init-form), where
   ;; variable is either a LEXICAL-VARIABLE or a SPECIAL-VARIABLE.
   ;; Init-forms are evaluated in list order.
   ;; Lexical bindings occur immediately
   ;; Special bindings occur once all init-forms have been evaulated.
-  ((%bindings :initarg :bindings :accessor bindings)
-   (%body :initarg :body :accessor body)))
+  ((%bindings :initarg :bindings :accessor bindings :accessor ast-bindings)
+   (%body :initarg :body :accessor body :accessor ast-body)))
 
-(defclass ast-multiple-value-bind ()
+(defclass ast-multiple-value-bind (ast-node)
   ;; BINDING is a list of variables, which can be either LEXICAL-VARIABLEs
   ;; or SPECIAL-VARIABLES.
   ;; Bindings occur after VALUE-FORM has been evaulated.
-  ((%bindings :initarg :bindings :accessor bindings)
-   (%value-form :initarg :value-form :accessor value-form)
-   (%body :initarg :body :accessor body)))
+  ((%bindings :initarg :bindings :accessor bindings :accessor ast-bindings)
+   (%value-form :initarg :value-form :accessor value-form :accessor ast-value-form)
+   (%body :initarg :body :accessor body :accessor ast-body)))
 
-(defclass ast-multiple-value-call ()
-  ((%function-form :initarg :function-form :accessor function-form)
-   (%value-form :initarg :value-form :accessor value-form)))
+(defclass ast-multiple-value-call (ast-node)
+  ((%function-form :initarg :function-form :accessor function-form :accessor ast-function-form)
+   (%value-form :initarg :value-form :accessor value-form :accessor ast-value-form)))
 
-(defclass ast-multiple-value-prog1 ()
-  ((%value-form :initarg :value-form :accessor value-form)
-   (%body :initarg :body :accessor body)))
+(defclass ast-multiple-value-prog1 (ast-node)
+  ((%value-form :initarg :value-form :accessor value-form :accessor ast-value-form)
+   (%body :initarg :body :accessor body :accessor ast-body)))
 
-(defclass ast-progn ()
-  ((%forms :initarg :forms :accessor forms)))
+(defclass ast-progn (ast-node)
+  ((%forms :initarg :forms :accessor forms :accessor ast-forms)))
 
-(defclass ast-quote ()
-  ((%value :initarg :value :accessor value)))
+(defclass ast-quote (ast-node)
+  ((%value :initarg :value :accessor value :accessor ast-value)))
 
 (defmethod print-object ((object ast-quote) stream)
   (print-unreadable-object (object stream :type t :identity t)
     (format stream "~S" (value object))))
 
-(defclass ast-return-from ()
-  ((%target :initarg :target :accessor target)
-   (%value :initarg :value :accessor value)
-   (%info :initarg :info :accessor info)))
+(defclass ast-return-from (ast-node)
+  ((%target :initarg :target :accessor target :accessor ast-target)
+   (%value :initarg :value :accessor value :accessor ast-value)
+   (%info :initarg :info :accessor info :accessor ast-info)))
 
-(defclass ast-setq ()
-  ((%variable :initarg :variable :accessor setq-variable)
-   (%value :initarg :value :accessor value)))
+(defclass ast-setq (ast-node)
+  ((%variable :initarg :variable :accessor setq-variable :accessor ast-setq-variable)
+   (%value :initarg :value :accessor value :accessor ast-value)))
 
-(defclass ast-tagbody ()
-  ((%info :initarg :info :accessor info)
+(defclass ast-tagbody (ast-node)
+  ((%info :initarg :info :accessor info :accessor ast-info)
    ;; A list of (go-tag form).
    ;; Form that do not end in a control transfer will cause the
    ;; tagbody to return.
    ;; Only the first statement is directly reachable, other
    ;; statements can only be reached via GO forms.
-   (%statements :initarg :statements :accessor statements)))
+   (%statements :initarg :statements :accessor statements :accessor ast-statements)))
 
-(defclass ast-the ()
-  ((%the-type :initarg :type :accessor the-type)
-   (%value :initarg :value :accessor value)))
+(defclass ast-the (ast-node)
+  ((%the-type :initarg :type :accessor the-type :accessor ast-the-type)
+   (%value :initarg :value :accessor value :accessor ast-value)))
 
-(defclass ast-unwind-protect ()
-  ((%protected-form :initarg :protected-form :accessor protected-form)
-   (%cleanup-function :initarg :cleanup-function :accessor cleanup-function)))
+(defmethod print-object ((instance ast-the) stream)
+  (print-unreadable-object (instance stream :type t :identity t)
+    (format stream "~S" (ast-the-type instance))))
 
-(defclass ast-call ()
-  ((%name :initarg :name :accessor name)
-   (%arguments :initarg :arguments :accessor arguments)))
+(defclass ast-unwind-protect (ast-node)
+  ((%protected-form :initarg :protected-form :accessor protected-form :accessor ast-protected-form)
+   (%cleanup-function :initarg :cleanup-function :accessor cleanup-function :accessor ast-cleanup-function)))
+
+(defclass ast-call (ast-node)
+  ((%name :initarg :name :accessor name :accessor ast-name)
+   (%arguments :initarg :arguments :accessor arguments :accessor ast-arguments)))
 
 (defmethod print-object ((object ast-call) stream)
   (print-unreadable-object (object stream :type t :identity t)
     (format stream "~S" (name object))))
 
-(defclass ast-jump-table ()
-  ((%value :initarg :value :accessor value)
-   (%targets :initarg :targets :accessor targets)))
+(defclass ast-jump-table (ast-node)
+  ((%value :initarg :value :accessor value :accessor ast-value)
+   (%targets :initarg :targets :accessor targets :accessor ast-targets)))
 
 (defmethod print-object ((object go-tag) stream)
   (print-unreadable-object (object stream :type t :identity t)
@@ -228,6 +260,7 @@
       (let ((new (make-instance (if (block-information-p var)
                                     'block-information
                                     'lexical-variable)
+                                :inherit var
                                 :name (lexical-variable-name var)
                                 :ignore (lexical-variable-ignore var)
                                 :dynamic-extent (lexical-variable-dynamic-extent var))))
@@ -241,6 +274,7 @@
 
 (defmethod copy-form-1 ((form ast-block))
   (make-instance 'ast-block
+                 :inherit form
                  :info (copy-variable (info form))
                  :body (copy-form-1 (body form))))
 
@@ -251,6 +285,7 @@
     (incf (lexical-variable-use-count (go-tag-tagbody tag)))
     (pushnew *current-lambda* (lexical-variable-used-in (go-tag-tagbody tag)))
     (make-instance 'ast-go
+                   :inherit form
                    :target tag
                    :info (copy-form-1 (info form)))))
 
@@ -259,6 +294,7 @@
 
 (defmethod copy-form-1 ((form ast-if))
   (make-instance 'ast-if
+                 :inherit form
                  :test (copy-form-1 (test form))
                  :then (copy-form-1 (if-then form))
                  :else (copy-form-1 (if-else form))))
@@ -270,6 +306,7 @@
      for (variable init-form) in (bindings form)
      do (copy-variable variable))
   (make-instance 'ast-let
+                 :inherit form
                  :bindings (loop
                               for (variable init-form) in (bindings form)
                               collect (list (copy-form-fix variable)
@@ -278,22 +315,26 @@
 
 (defmethod copy-form-1 ((form ast-multiple-value-bind))
   (make-instance 'ast-multiple-value-bind
+                 :inherit form
                  :bindings (mapcar #'copy-variable (bindings form))
                  :value-form (copy-form-1 (value-form form))
                  :body (copy-form-1 (body form))))
 
 (defmethod copy-form-1 ((form ast-multiple-value-call))
   (make-instance 'ast-multiple-value-call
+                 :inherit form
                  :function-form (copy-form-1 (function-form form))
                  :value-form (copy-form-1 (value-form form))))
 
 (defmethod copy-form-1 ((form ast-multiple-value-prog1))
   (make-instance 'ast-multiple-value-prog1
+                 :inherit form
                  :value-form (copy-form-1 (value-form form))
                  :body (copy-form-1 (body form))))
 
 (defmethod copy-form-1 ((form ast-progn))
   (make-instance 'ast-progn
+                 :inherit form
                  :forms (loop
                            for form in (forms form)
                            collect (copy-form-1 form))))
@@ -306,6 +347,7 @@
     (incf (lexical-variable-use-count var))
     (pushnew *current-lambda* (lexical-variable-used-in var))
     (make-instance 'ast-return-from
+                   :inherit form
                    :target var
                    :value (copy-form-1 (value form))
                    :info (copy-form-1 (info form)))))
@@ -316,20 +358,24 @@
     (incf (lexical-variable-write-count var))
     (pushnew *current-lambda* (lexical-variable-used-in var))
     (make-instance 'ast-setq
+                   :inherit form
                    :variable var
                    :value (copy-form-1 (value form)))))
 
 (defmethod copy-form-1 ((form ast-tagbody))
   (let ((info (make-instance 'tagbody-information
+                             :inherit (info form)
                              :definition-point (copy-form-fix (lexical-variable-definition-point (info form))))))
     (push (cons (info form) info) *replacements*)
     (dolist (tag (tagbody-information-go-tags (info form)))
       (let ((new-tag (make-instance 'go-tag
+                                    :inherit tag
                                     :name (go-tag-name tag)
                                     :tagbody info)))
         (push new-tag (tagbody-information-go-tags info))
         (push (cons tag new-tag) *replacements*)))
     (make-instance 'ast-tagbody
+                   :inherit form
                    :info info
                    :statements (loop
                                   for (go-tag statement) in (statements form)
@@ -338,16 +384,19 @@
 
 (defmethod copy-form-1 ((form ast-the))
   (make-instance 'ast-the
+                 :inherit form
                  :type (the-type form)
                  :value (copy-form-1 (value form))))
 
 (defmethod copy-form-1 ((form ast-unwind-protect))
   (make-instance 'ast-unwind-protect
+                 :inherit form
                  :protected-form (copy-form-1 (protected-form form))
                  :cleanup-function (copy-form-1 (cleanup-function form))))
 
 (defmethod copy-form-1 ((form ast-call))
   (make-instance 'ast-call
+                 :inherit form
                  :name (name form)
                  :arguments (loop
                                for arg in (arguments form)
@@ -355,6 +404,7 @@
 
 (defmethod copy-form-1 ((form ast-jump-table))
   (make-instance 'ast-jump-table
+                 :inherit form
                  :value (copy-form-1 (value form))
                  :targets (loop
                              for targ in (targets form)
@@ -368,6 +418,7 @@
 
 (defmethod copy-form-1 ((form lambda-information))
   (let* ((info (make-instance 'lambda-information
+                              :inherit form
                               :name (lambda-information-name form)
                               :docstring (lambda-information-docstring form)
                               :lambda-list (lambda-information-lambda-list form)
@@ -400,6 +451,15 @@
     (when (lambda-information-environment-arg form)
       (setf (lambda-information-environment-arg info)
             (copy-variable (lambda-information-environment-arg form))))
+    (when (lambda-information-fref-arg form)
+      (setf (lambda-information-fref-arg info)
+            (copy-variable (lambda-information-fref-arg form))))
+    (when (lambda-information-closure-arg form)
+      (setf (lambda-information-closure-arg info)
+            (copy-variable (lambda-information-closure-arg form))))
+    (when (lambda-information-count-arg form)
+      (setf (lambda-information-count-arg info)
+            (copy-variable (lambda-information-count-arg form))))
     (setf (lambda-information-body info)
           (copy-form-1 (lambda-information-body form)))
     info))
@@ -526,6 +586,12 @@
         (reset-var (third arg))))
     (when (lambda-information-environment-arg form)
       (reset-var (lambda-information-environment-arg form)))
+    (when (lambda-information-fref-arg form)
+      (reset-var (lambda-information-fref-arg form)))
+    (when (lambda-information-closure-arg form)
+      (reset-var (lambda-information-closure-arg form)))
+    (when (lambda-information-count-arg form)
+      (reset-var (lambda-information-count-arg form)))
     (detect-uses-1 (lambda-information-body form))))
 
 ;;; Pretty-printing.
@@ -618,5 +684,11 @@
                                               (when suppliedp
                                                 (unparse-compiler-form suppliedp))))
                            ,@(when (lambda-information-allow-other-keys form)
-                                   '(&allow-other-keys)))))
+                                   '(&allow-other-keys))))
+                       (when (lambda-information-fref-arg form)
+                         `(sys.int::&fref ,(unparse-compiler-form (lambda-information-fref-arg form))))
+                       (when (lambda-information-closure-arg form)
+                         `(sys.int::&closure ,(unparse-compiler-form (lambda-information-closure-arg form))))
+                       (when (lambda-information-count-arg form)
+                         `(sys.int::&count ,(unparse-compiler-form (lambda-information-count-arg form)))))
         ,(unparse-compiler-form (lambda-information-body form))))))

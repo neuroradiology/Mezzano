@@ -7,7 +7,9 @@
       (sys.int::symbol-macroexpand-1 symbol)
     (if expandedp
         (make-instance 'symbol-macro :name symbol :expansion expansion)
-        (make-instance 'special-variable :name symbol))))
+        (make-instance 'special-variable
+                       :name symbol
+                       :implicitly-declared (not (sys.int::variable-information symbol))))))
 
 (defmethod lookup-function-in-environment (name (environment null))
   (make-instance 'top-level-function :name name))
@@ -29,3 +31,9 @@
 
 (defmethod macro-function-in-environment (symbol (environment null))
   (macro-function symbol))
+
+(defmethod lookup-variable-declared-type-in-environment (symbol (environment null))
+  (mezzano.runtime::symbol-type symbol))
+
+(defmethod optimize-qualities-in-environment ((environment null))
+  '())

@@ -127,6 +127,7 @@
 (defconstant +symbol-value+ 2)
 (defconstant +symbol-function+ 3)
 (defconstant +symbol-plist+ 4)
+(defconstant +symbol-type+ 5)
 
 (defconstant +symbol-value-cell-symbol+ 1)
 (defconstant +symbol-value-cell-value+ 2)
@@ -218,54 +219,64 @@
 (defconstant +address-tag-general+      #b010)
 (defconstant +address-tag-cons+         #b011)
 
-(defconstant +block-map-present+ 1 "Entry is present. This entry may still have a block associated with it, even if it is not present.")
-(defconstant +block-map-writable+ 2 "Entry is writable.")
-(defconstant +block-map-zero-fill+ 4 "Entry should be zero-filled.")
-(defconstant +block-map-committed+ 8
+(defconstant +block-map-present+ #x01
+  "Entry is present. This entry may still have a block associated with it, even if it is not present.")
+(defconstant +block-map-writable+ #x02
+  "Entry is writable.")
+(defconstant +block-map-zero-fill+ #x04
+  "Entry should be zero-filled.")
+(defconstant +block-map-committed+ #x08
   "This block is owned by the currently running system, not by a previous snapshot and can be written to safely.
 Internal to the pager, should not be used by other code.")
+(defconstant +block-map-wired+ #x10
+  "Entry should be wired in memory.")
 (defconstant +block-map-flag-mask+ #xFF)
 (defconstant +block-map-id-shift+ 8)
 (defconstant +block-map-id-size+ 54) ; keep it a few bits smaller than 56 to avoid bignums.
 (defconstant +block-map-id-lazy+ (1- (ash 1 +block-map-id-size+))
   "When stored in the ID field, this value indicates that space has been
 reserved on the disk, but no specific block has been allocated.")
+(defconstant +block-map-id-not-allocated+ 0)
 
-(defparameter *llf-version* 13)
+(defparameter *llf-version* 19)
 
-(defconstant +llf-end-of-load+ #xFF)
-(defconstant +llf-backlink+ #x01)
-(defconstant +llf-function+ #x02)
-(defconstant +llf-cons+ #x03)
-(defconstant +llf-symbol+ #x04)
-(defconstant +llf-uninterned-symbol+ #x05)
-(defconstant +llf-unbound+ #x06)
-(defconstant +llf-string+ #x07)
-(defconstant +llf-setf-symbol+ #x08)
-(defconstant +llf-integer+ #x09)
-;; Call a function, ignore the result.
-(defconstant +llf-invoke+ #x0A)
-(defconstant +llf-setf-fdefinition+ #x0B)
-(defconstant +llf-simple-vector+ #x0C)
-(defconstant +llf-character+ #x0D)
-(defconstant +llf-structure-definition+ #x0E)
-(defconstant +llf-single-float+ #x10)
-(defconstant +llf-proper-list+ #x11)
-(defconstant +llf-package+ #x12)
+(defconstant +llf-arch-x86-64+ 1)
+(defconstant +llf-arch-arm64+ 2)
+
+(defconstant +llf-end-of-load+               #xFF)
+(defconstant +llf-backlink+                  #x01)
+(defconstant +llf-function+                  #x02)
+(defconstant +llf-cons+                      #x03)
+(defconstant +llf-symbol+                    #x04)
+(defconstant +llf-uninterned-symbol+         #x05)
+(defconstant +llf-unbound+                   #x06)
+(defconstant +llf-string+                    #x07)
+(defconstant +llf-integer+                   #x09)
+(defconstant +llf-simple-vector+             #x0C)
+(defconstant +llf-character+                 #x0D)
+(defconstant +llf-structure-definition+      #x0E)
+(defconstant +llf-single-float+              #x10)
+(defconstant +llf-proper-list+               #x11)
+(defconstant +llf-package+                   #x12)
 ;; A vector consisting entirely of integers.
-(defconstant +llf-integer-vector+ #x13)
-(defconstant +llf-add-backlink+ #x14)
-(defconstant +llf-ratio+ #x15)
-(defconstant +llf-array+ #x16)
-;; Call a function, push the result.
-(defconstant +llf-funcall+ #x17)
-(defconstant +llf-bit-vector+ #x18)
-(defconstant +llf-function-reference+ #x19)
-(defconstant +llf-character-with-bits+ #x1A)
+(defconstant +llf-integer-vector+            #x13)
+(defconstant +llf-add-backlink+              #x14)
+(defconstant +llf-ratio+                     #x15)
+(defconstant +llf-array+                     #x16)
+(defconstant +llf-bit-vector+                #x18)
+(defconstant +llf-function-reference+        #x19)
+(defconstant +llf-character-with-bits+       #x1A)
 (defconstant +llf-structure-slot-definition+ #x1B)
-(defconstant +llf-byte+ #x1C)
-(defconstant +llf-double-float+ #x1D)
-(defconstant +llf-typed-array+ #x1E)
+(defconstant +llf-byte+                      #x1C)
+(defconstant +llf-double-float+              #x1D)
+(defconstant +llf-typed-array+               #x1E)
+;; Call a function with N arguments, push the result.
+(defconstant +llf-funcall-n+                 #x1F)
+;; Discard the top of stack value.
+(defconstant +llf-drop+                      #x20)
+(defconstant +llf-complex-rational+          #x21)
+(defconstant +llf-complex-single-float+      #x22)
+(defconstant +llf-complex-double-float+      #x23)
 
 ;;; Fields in the Unicode info tables.
 

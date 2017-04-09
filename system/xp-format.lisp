@@ -111,7 +111,7 @@
 
 (defmacro formatter (string)
   `(lambda (s &rest args)
-     (declare (system:lambda-name (formatter ,string)))
+     (declare (sys.int::lambda-name (formatter ,string)))
      (formatter-in-package ,string "CL-USER")))
 
 (defvar *errors-are-errors* t)
@@ -375,7 +375,8 @@
   (declare (ignore end))
   (multiple-value-bind (colon atsign params)
       (parse-params start '(nil #\Space #\, 3))
-    `(sys.format::format-integer XP ,(get-arg) ,base (list ,@params) ',atsign ',colon)))
+    `(let ((the-params (list ,@params)))
+       (sys.format::format-integer XP ,(get-arg) ,base the-params ',atsign ',colon))))
 
 (def-format-handler #\D (start end) (impl-integer start end 10))
 (def-format-handler #\B (start end) (impl-integer start end 2))
@@ -386,17 +387,18 @@
   (declare (ignore end))
   (multiple-value-bind (colon atsign params)
       (parse-params start '(:no-parameters-specified nil #\Space #\, 3))
-    `(sys.format::format-radix XP
-                               ,(get-arg)
-                               ;; If no parameters are specified, then pass in
-                               ;; an empty param list to format-radix. That's
-                               ;; how it it knows to print cardinal/ordinal
-                               ;; numbers.
-                               ,(if (eql (first params) :no-parameters-specified)
-                                    '()
-                                    `(list ,@params))
-                               ',atsign
-                               ',colon)))
+    ;; If no parameters are specified, then pass in
+    ;; an empty param list to format-radix. That's
+    ;; how it it knows to print cardinal/ordinal
+    ;; numbers.
+    `(let ((the-params ,(if (eql (first params) :no-parameters-specified)
+                            '()
+                            `(list ,@params))))
+       (sys.format::format-radix XP
+                                 ,(get-arg)
+                                 the-params
+                                 ',atsign
+                                 ',colon))))
 
 (def-format-handler #\C (start end)
   (declare (ignore end))
@@ -522,8 +524,8 @@
 
 (defun do-complex-^-test (a1 &optional (a2 nil) (a3 nil))
   (cond (a3 (and (<= a1 a2) (<= a2 a3)))
-        (a2 (= a1 a2))
-        (t (= 0 a1))))
+        (a2 (eql a1 a2))
+        (t (eql 0 a1))))
 
 ;delimited pairs of format directives. "(){}[]<>;"
 
@@ -763,7 +765,7 @@
 
 (defun compile-format-string (string)
   (let ((form `(lambda (s &rest args)
-                 (declare (system:lambda-name (formatter ,string)))
+                 (declare (sys.int::lambda-name (formatter ,string)))
                  ,(formatter-fn string "CL-USER" t))))
     (cond (*compiling-format-string*
            (values (mezzano.full-eval:eval-in-lexenv form nil) nil))

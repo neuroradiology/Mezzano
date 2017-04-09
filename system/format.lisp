@@ -190,7 +190,7 @@
         (colon-sym (or colon (gensym "Colon"))))
     `(setf (format-interpreter ',character)
            (lambda (,arguments ,at-sign-sym ,colon-sym ,@parameter-lambda-list)
-             (declare (system:lambda-name (format-interpreter ,character)))
+             (declare (sys.int::lambda-name (format-interpreter ,character)))
              (block nil
                ,@(when (not at-sign)
                        (list `(when ,at-sign-sym
@@ -209,9 +209,9 @@
 
 (defun format-integer (stream n base params at-sign colon)
   (let ((mincol (first params))
-	(padchar (or (second params) #\Space))
-	(commachar (or (third params) #\,))
-	(comma-interval (or (fourth params) 3)))
+        (padchar (or (second params) #\Space))
+        (commachar (or (third params) #\,))
+        (comma-interval (or (fourth params) 3)))
     (unless (integerp n)
       (return-from format-integer
         (let ((*print-base* base))
@@ -222,44 +222,44 @@
     (when (cddddr params)
       (error "Expected 0 to 4 parameters."))
     (if (or mincol colon)
-	;; Fancy formatting.
-	(let ((buffer (make-array 8
-				  :element-type 'character
-				  :adjustable t
-				  :fill-pointer 0))
-	      (negative nil))
-	  (when (minusp n)
-	    (setf negative t
-		  n (- n)))
-	  (unless mincol (setf mincol 0))
+        ;; Fancy formatting.
+        (let ((buffer (make-array 8
+                                  :element-type 'character
+                                  :adjustable t
+                                  :fill-pointer 0))
+              (negative nil))
+          (when (minusp n)
+            (setf negative t
+                  n (- n)))
+          (unless mincol (setf mincol 0))
           ;; Write the number backwards into the buffer, no commas or padding yet.
-	  (if (= n 0)
-	      (vector-push-extend #\0 buffer)
-	      (do () ((= n 0))
-		(multiple-value-bind (quot rem)
-		    (truncate n base)
-		  (vector-push-extend (char "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ" rem) buffer)
-		  (setf n quot))))
-	  ;; TODO: count commas as well
-	  (dotimes (i (- mincol (+ (length buffer) (if (or negative at-sign) 1 0))))
-	    (write-char padchar stream))
+          (if (= n 0)
+              (vector-push-extend #\0 buffer)
+              (do () ((= n 0))
+                (multiple-value-bind (quot rem)
+                    (truncate n base)
+                  (vector-push-extend (char "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ" rem) buffer)
+                  (setf n quot))))
+          ;; TODO: count commas as well
+          (dotimes (i (- mincol (+ (length buffer) (if (or negative at-sign) 1 0))))
+            (write-char padchar stream))
           (cond
             (negative
              (write-char #\- stream))
             (at-sign
              (write-char #\+ stream)))
-	  (if colon
-	      (dotimes (i (length buffer))
-		(when (and (not (zerop i))
+          (if colon
+              (dotimes (i (length buffer))
+                (when (and (not (zerop i))
                            (zerop (rem (- (length buffer) i) comma-interval)))
-		  (write-char commachar stream))
-		(write-char (char buffer (- (length buffer) i 1)) stream))
-	      (dotimes (i (length buffer))
-		(write-char (char buffer (- (length buffer) i 1)) stream))))
-	(progn
-	  (when (and at-sign (not (minusp n)))
-	    (write-char #\+ stream))
-	  (write n :stream stream :escape nil :radix nil :base base :readably nil)))))
+                  (write-char commachar stream))
+                (write-char (char buffer (- (length buffer) i 1)) stream))
+              (dotimes (i (length buffer))
+                (write-char (char buffer (- (length buffer) i 1)) stream))))
+        (progn
+          (when (and at-sign (not (minusp n)))
+            (write-char #\+ stream))
+          (write n :stream stream :escape nil :radix nil :base base :readably nil)))))
 
 (defvar *cardinal-names-1*
   '("zero" "one" "two" "three" "four" "five" "six" "seven" "eight" "nine"
@@ -268,9 +268,9 @@
   '("zero" "ten" "twenty" "thirty" "forty" "fifty" "sixty" "seventy" "eighty" "ninety"))
 (defvar *ordinal-names-1*
   '("zeroth" "first" "second" "third" "fourth" "fifth" "sixth" "seventh" "eighth" "ninth"
-    "tenth" "eleventh" "twelveth" "thirteenth" "fourteenth" "fifteenth" "sixteenth" "seventeenth" "eighteenth" "nineteenth"))
+    "tenth" "eleventh" "twelfth" "thirteenth" "fourteenth" "fifteenth" "sixteenth" "seventeenth" "eighteenth" "nineteenth"))
 (defvar *ordinal-names-10*
-  '("zeroth" "tenth" "twenieth" "thirtieth" "fortieth" "fiftieth" "sixtieth" "seventieth" "eightieth" "ninetieth"))
+  '("zeroth" "tenth" "twentieth" "thirtieth" "fortieth" "fiftieth" "sixtieth" "seventieth" "eightieth" "ninetieth"))
 (defvar *radix-powers*
   '((1000000 "million" "millionth") (1000 "thousand" "thousandth") (100 "hundred" "hundredth")))
 

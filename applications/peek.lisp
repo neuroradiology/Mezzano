@@ -34,9 +34,7 @@
   (dolist (thread (mezzano.supervisor:all-threads))
     (format t " ~A~24T~A~%" (mezzano.supervisor:thread-name thread) (mezzano.supervisor:thread-state thread))
     (when (eql (mezzano.supervisor:thread-state thread) :sleeping)
-      (format t "  Waiting on ")
-      (print-unreadable-object ((mezzano.supervisor:thread-wait-item thread) *standard-output* :type t :identity t))
-      (terpri))))
+      (format t "  Waiting on ~S~%" (mezzano.supervisor:thread-wait-item thread)))))
 
 (defun peek-memory ()
   (room))
@@ -50,11 +48,11 @@
   (dolist (card mezzano.network.ethernet::*cards*)
     (let ((address (mezzano.network.ip:ipv4-interface-address card nil)))
       (format t " ~S~%" card)
-      (format t "   Mac: ~/mezzano.network.ethernet:format-mac-address/~%" (mezzano.supervisor:nic-mac card))
+      (format t "   Mac: ~/mezzano.network.ethernet:format-mac-address/~%" (mezzano.driver.network-card:mac-address card))
       (when address
         (format t "   IPv4 address: ~A~%" address))
       (multiple-value-bind (rx-bytes rx-packets rx-errors tx-bytes tx-packets tx-errors collisions)
-          (mezzano.supervisor:net-statistics card)
+          (mezzano.driver.network-card:statistics card)
         (format t "   ~:D octets, ~:D packets received. ~:D RX errors.~%"
                 rx-bytes rx-packets rx-errors)
         (format t "   ~:D octets, ~:D packets transmitted. ~:D TX errors.~%"
@@ -233,9 +231,14 @@
 (defun peek-disk ()
   (dolist (disk (mezzano.supervisor:all-disks))
     (format t "~S:~%" disk)
+    (if (mezzano.supervisor:disk-writable-p disk)
+        (format t "  Read/write.~%")
+        (format t "  Read-only.~%"))
     (format t "  Sector size: ~:D octets.~%" (mezzano.supervisor:disk-sector-size disk))
     (format t "   Total size: ~:D sectors.~%" (mezzano.supervisor:disk-n-sectors disk))
-    (format t "               ~:D octets.~%" (* (mezzano.supervisor:disk-n-sectors disk) (mezzano.supervisor:disk-sector-size disk)))))
+    (format t "               ~:D octets.~%" (* (mezzano.supervisor:disk-n-sectors disk) (mezzano.supervisor:disk-sector-size disk)))
+    (when (eql disk mezzano.supervisor::*paging-disk*)
+      (format t "  Paging disk.~%"))))
 
 (defclass peek-window ()
   ((%window :initarg :window :reader window)
@@ -272,7 +275,40 @@
     (mezzano.gui.widgets:close-button-clicked ()
       (throw 'quit nil))))
 
+(defmethod dispatch-event (app (event mezzano.gui.compositor:resize-request-event))
+  (let ((old-width (mezzano.gui.compositor:width (window app)))
+        (old-height (mezzano.gui.compositor:height (window app)))
+        (new-width (max 100 (mezzano.gui.compositor:width event)))
+        (new-height (max 100 (mezzano.gui.compositor:height event))))
+    (when (or (not (eql old-width new-width))
+              (not (eql old-height new-height)))
+      (let ((new-framebuffer (mezzano.gui:make-surface
+                              new-width new-height)))
+        (mezzano.gui.widgets:resize-frame (frame app) new-framebuffer)
+        (mezzano.gui.compositor:resize-window
+         (window app) new-framebuffer
+         :origin (mezzano.gui.compositor:resize-origin event))))))
+
+(defmethod dispatch-event (app (event mezzano.gui.compositor:resize-event))
+  (let* ((fb (mezzano.gui.compositor:window-buffer (window app)))
+         (new-width (mezzano.gui:surface-width fb))
+         (new-height (mezzano.gui:surface-height fb)))
+    (mezzano.gui.widgets:resize-text-widget (text-pane app)
+                                            fb
+                                            (nth-value 0 (mezzano.gui.widgets:frame-size (frame app)))
+                                            (nth-value 2 (mezzano.gui.widgets:frame-size (frame app)))
+                                            (- new-width
+                                               (nth-value 0 (mezzano.gui.widgets:frame-size (frame app)))
+                                               (nth-value 1 (mezzano.gui.widgets:frame-size (frame app))))
+                                            (- new-height
+                                               (nth-value 2 (mezzano.gui.widgets:frame-size (frame app)))
+                                               (nth-value 3 (mezzano.gui.widgets:frame-size (frame app))))))
+  (setf (redraw app) t))
+
 (defmethod dispatch-event (peek (event mezzano.gui.compositor:window-close-event))
+  (throw 'quit nil))
+
+(defmethod dispatch-event (peek (event mezzano.gui.compositor:quit-event))
   (throw 'quit nil))
 
 (defun peek-main ()
@@ -288,7 +324,9 @@
                                        :framebuffer framebuffer
                                        :title "Peek"
                                        :close-button-p t
-                                       :damage-function (mezzano.gui.widgets:default-damage-function window)))
+                                       :resizablep t
+                                       :damage-function (mezzano.gui.widgets:default-damage-function window)
+                                       :set-cursor-function (mezzano.gui.widgets:default-cursor-function window)))
                  (peek (make-instance 'peek-window
                                       :window window
                                       :frame frame))
@@ -324,8 +362,17 @@
                    (fresh-line)
                    (ignore-errors
                      (funcall (mode peek)))))
-               (dispatch-event peek (mezzano.supervisor:fifo-pop fifo)))))))))
+               (when (not (redraw peek))
+                 (dispatch-event peek (mezzano.supervisor:fifo-pop fifo))))))))))
 
 (defun spawn ()
   (mezzano.supervisor:make-thread 'peek-main
-                                  :name "Peek"))
+                                  :name "Peek"
+                                  :initial-bindings `((*terminal-io* ,(make-instance 'mezzano.gui.popup-io-stream:popup-io-stream
+                                                                                     :title "Peek console"))
+                                                      (*standard-input* ,(make-synonym-stream '*terminal-io*))
+                                                      (*standard-output* ,(make-synonym-stream '*terminal-io*))
+                                                      (*error-output* ,(make-synonym-stream '*terminal-io*))
+                                                      (*trace-output* ,(make-synonym-stream '*terminal-io*))
+                                                      (*debug-io* ,(make-synonym-stream '*terminal-io*))
+                                                      (*query-io* ,(make-synonym-stream '*terminal-io*)))))

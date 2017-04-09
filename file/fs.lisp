@@ -2,7 +2,7 @@
 ;;;; This code is licensed under the MIT license.
 
 (defpackage :mezzano.file-system
-  (:use #:cl)
+  (:use :cl)
   (:export #:find-host
            #:list-all-hosts
            #:logical-host
@@ -23,13 +23,14 @@
            #:expunge-directory-using-host
            #:file-stream-pathname
            #:simple-file-error
-           #:stream-truename))
+           #:stream-truename
+           #:truename-using-host))
 
 (in-package :mezzano.file-system)
 
 (define-condition file-error (error)
   ((pathname :initarg :pathname
-	     :reader file-error-pathname)))
+             :reader file-error-pathname)))
 
 (define-condition simple-file-error (file-error simple-error)
   ())
@@ -184,6 +185,9 @@
 (defgeneric unparse-pathname-file (pathname host))
 (defgeneric unparse-pathname-directory (pathname host))
 
+(defun host-namestring (pathname)
+  (host-name (pathname-host pathname)))
+
 (defun file-namestring (pathname)
   (unparse-pathname-file pathname (pathname-host pathname)))
 
@@ -220,14 +224,21 @@
 
 (defgeneric stream-truename (stream))
 
+(defgeneric truename-using-host (host pathname))
+
+(defmethod truename-using-host (host pathname)
+  (or (probe-file pathname)
+      (error 'simple-file-error
+             :pathname pathname
+             :format-control "No such file.")))
+
 (defun truename (pathname)
   (cond
     ((typep pathname 'file-stream)
      (stream-truename pathname))
-    (t (or (probe-file pathname)
-           (error 'simple-file-error
-                  :pathname pathname
-                  :format-control "No such file.")))))
+    (t
+     (let ((p (translate-logical-pathname (merge-pathnames pathname))))
+       (truename-using-host (pathname-host p) p)))))
 
 (defun merge-pathnames (pathname &optional
                         (default-pathname *default-pathname-defaults*)
@@ -288,6 +299,7 @@
 
 (defun parse-namestring (thing &optional host (default-pathname *default-pathname-defaults*) &key (start 0) (end nil) junk-allowed)
   (setf thing (sys.int::follow-synonym-stream thing))
+  (check-type thing (or string pathname stream))
   (when (typep thing 'file-stream)
     (setf thing (file-stream-pathname thing)))
   (etypecase thing
@@ -647,6 +659,9 @@ NAMESTRING as the second."
                  (write-string "NEWEST" namestring))
                 (t
                  (write type namestring))))))))
+
+(defmethod host-default-device ((host logical-host))
+  nil)
 
 (defun logical-pathname-translations (host)
   (let ((host (or (find-host host nil)

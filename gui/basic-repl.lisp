@@ -32,6 +32,9 @@
   (when (not (mezzano.gui.compositor:key-releasep event))
     (mezzano.supervisor:fifo-push (mezzano.gui.compositor:key-key event) (input-buffer window) nil)))
 
+(defmethod dispatch-event (window (event mezzano.gui.compositor:quit-event))
+  (throw 'mezzano.supervisor:terminate-thread nil))
+
 (defun pump-event-loop (window)
   "Read & dispatch window events until there are no more waiting events."
   (loop
@@ -138,7 +141,7 @@
       ((>= i end)
        (values initial-x initial-y))
     (let* ((ch (char string i))
-	   (width (sys.int::stream-character-width stream ch)))
+           (width (sys.int::stream-character-width stream ch)))
       (when (or (eql ch #\Newline)
                 (> (+ initial-x width) win-width))
         (setf initial-x 0

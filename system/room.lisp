@@ -116,7 +116,8 @@ Should be kept in sync with data-types.")
       (incf total-used allocated-words)
       (incf total total-words)
       (when (eql verbosity t)
-        (print-n-allocated-objects-table n-allocated-objects allocated-object-sizes allocated-classes)))
+        (print-n-allocated-objects-table n-allocated-objects allocated-object-sizes allocated-classes)
+        (print-fragment-counts (pinned-area-fragment-counts :wired))))
     (multiple-value-bind (allocated-words total-words largest-free-space n-allocated-objects allocated-object-sizes allocated-classes)
         (area-info :pinned)
       (format t "Pinned area: ~:D/~:D words allocated (~D%).~%"
@@ -126,21 +127,28 @@ Should be kept in sync with data-types.")
       (incf total-used allocated-words)
       (incf total total-words)
       (when (eql verbosity t)
-        (print-n-allocated-objects-table n-allocated-objects allocated-object-sizes allocated-classes)))
+        (print-n-allocated-objects-table n-allocated-objects allocated-object-sizes allocated-classes)
+        (print-fragment-counts (pinned-area-fragment-counts :pinned))))
     (format t "Total ~:D/~:D words used (~D%).~%"
             total-used total
             (truncate (* total-used 100) total))
-    (multiple-value-bind (n-free-blocks total-blocks)
-        (mezzano.supervisor:store-statistics)
-      (format t "~:D/~:D store blocks used (~D%).~%"
-              (- total-blocks n-free-blocks) total-blocks
-              (truncate (* (- total-blocks n-free-blocks) 100) total-blocks)))
+    (when (not (eql mezzano.supervisor::*paging-disk* :freestanding))
+      (multiple-value-bind (n-free-blocks total-blocks)
+          (mezzano.supervisor:store-statistics)
+        (format t "~:D/~:D store blocks used (~D%).~%"
+                (- total-blocks n-free-blocks) total-blocks
+                (truncate (* (- total-blocks n-free-blocks) 100) total-blocks))))
     (multiple-value-bind (n-free-page-frames total-page-frames)
         (mezzano.supervisor:physical-memory-statistics)
       (format t "~:D/~:D physical pages used (~D%).~%"
               (- total-page-frames n-free-page-frames) total-page-frames
               (truncate (* (- total-page-frames n-free-page-frames) 100)
                         total-page-frames))))
+  (when (eql verbosity t)
+    (format t "Paging disk is ~S.~%" mezzano.supervisor::*paging-disk*)
+    (format t "Fudge-factor is ~D.~%" mezzano.supervisor::*store-fudge-factor*)
+    (when mezzano.supervisor::*paging-read-only*
+      (format t "Running in read-only mode.~%")))
   (values))
 
 (defun %walk-pinned-area (base limit fn)
@@ -222,6 +230,7 @@ FN will be called with the world stopped, it must not allocate."
                   (vector-push 1 allocated-classes))))
       (walk-area area
                  (lambda (object address size)
+                   (declare (ignore address))
                    (let ((tag (if (consp object)
                                   +object-tag-cons+
                                   (%object-tag object))))
@@ -241,3 +250,19 @@ FN will be called with the world stopped, it must not allocate."
                         (add-class (%struct-slot object 0))))))))
     (values allocated-words total-words largest-free-space
             n-allocated-objects allocated-objects-sizes allocated-classes)))
+
+(defun print-fragment-counts (counts)
+  (format t "  Free fragment counts:~%")
+  (dotimes (i (length counts))
+    (let ((n (aref counts i)))
+      (when (not (zerop n))
+        (format t "    ~:D words:~35T~D~%" (ash 1 i) n)))))
+
+(defun pinned-area-fragment-counts (area)
+  (let ((counts (make-array 64 :initial-element 0)))
+    (walk-area area
+               (lambda (object address size)
+                 (declare (ignore address))
+                 (when (%object-of-type-p object +object-tag-freelist-entry+)
+                   (incf (aref counts (integer-length (1- size)))))))
+    counts))

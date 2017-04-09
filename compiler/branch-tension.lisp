@@ -1,7 +1,7 @@
 ;;;; Copyright (c) 2011-2016 Henry Harrington <henry.harrington@gmail.com>
 ;;;; This code is licensed under the MIT license.
 
-(in-package :sys.c)
+(in-package :mezzano.compiler.codegen.x86-64)
 
 ;;;; This pass works on a LAP program.
 ;;;; It removes unused labels, tensions branches to unconditional branches,
@@ -136,9 +136,11 @@
     (do ((i program (cdr i)))
         ((null i))
       (when (symbolp (car i))
-        ;; Search forward until a non-label is found.
+        ;; Search forward until a non-label, non-:gc is found.
         (do ((j i (cdr j)))
-            ((or (not (symbolp (car j)))
+            ((or (not (or (symbolp (car j))
+                          (and (consp (car j))
+                               (eql (first (car j)) :gc))))
                  (null j))
              (setf (gethash (car i) targets) j)))))
     targets))

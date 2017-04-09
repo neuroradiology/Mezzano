@@ -23,7 +23,7 @@
 
 (defgeneric make-load-form (object &optional environment))
 
-(defun raise-undefined-function (invoked-through &rest args)
+(defun raise-undefined-function (&rest args &fref invoked-through)
   (setf invoked-through (function-reference-name invoked-through))
   ;; Allow restarting.
   ;; FIXME: Restarting doesn't actually work, as args are lost by the undefined function thunk.
@@ -54,17 +54,27 @@
   (print-unreadable-object (object stream :type t :identity t)
     (format stream "~S" (mezzano.supervisor:thread-name object))))
 
-(defmethod print-object ((object mezzano.supervisor::nic) stream)
-  (print-unreadable-object (object stream :type t :identity t)
-    (format stream "~:(~A~) ~/mezzano.network.ethernet:format-mac-address/"
-            (type-of (mezzano.supervisor::nic-device object))
-            (mezzano.supervisor:nic-mac object))))
-
 (defmethod print-object ((object mezzano.supervisor::disk) stream)
   (print-unreadable-object (object stream :identity t)
     (format stream "Disk")
     (when (typep (mezzano.supervisor::disk-device object) 'mezzano.supervisor::partition)
       (format stream " Partition on ~S" (mezzano.supervisor::partition-disk (mezzano.supervisor::disk-device object))))))
+
+(defmethod print-object ((object mezzano.supervisor::wait-queue) stream)
+  (print-unreadable-object (object stream :type t :identity t)
+    (format stream "~S" (mezzano.supervisor::wait-queue-name object))))
+
+(defmethod print-object ((object mezzano.supervisor::mutex) stream)
+  (print-unreadable-object (object stream :type t :identity t)
+    (format stream "~S" (mezzano.supervisor::mutex-name object))
+    (let ((owner (mezzano.supervisor::mutex-owner object)))
+      (if owner
+          (format stream " held by ~S" owner)
+          (format stream " unlocked")))))
+
+(defmethod print-object ((object mezzano.supervisor::condition-variable) stream)
+  (print-unreadable-object (object stream :type t :identity t)
+    (format stream "~S" (mezzano.supervisor::condition-variable-name object))))
 
 (defmethod print-object ((object package) stream)
   (print-unreadable-object (object stream :type t)
@@ -158,7 +168,7 @@ The file will only be recompiled if the source is newer than the output file, or
 (defun %define-symbol-macro (name expansion)
   (check-type name symbol)
   (when (not (member (symbol-mode name) '(nil :symbol-macro)))
-    (cerror "Redefine as a symbol-macro" "Symbol ~S already defined as a ~A" name (symbol-mode form)))
+    (cerror "Redefine as a symbol-macro" "Symbol ~S already defined as a ~A" name (symbol-mode name)))
   (setf (symbol-mode name) :symbol-macro)
   (setf (gethash name *symbol-macro-expansions*) expansion)
   name)

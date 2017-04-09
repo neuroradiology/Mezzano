@@ -47,9 +47,10 @@
   ;; delay a little to allow any NIC drivers to complete.
   ;; TODO: Need a notification mechanism to detect when NICs are attached/detached.
   (sleep 1)
-  (setf mezzano.network.ethernet::*cards* (copy-list mezzano.supervisor:*nics*)
+  (setf mezzano.network.ethernet::*cards* (copy-list mezzano.driver.network-card::*nics*)
         mezzano.network.ip::*routing-table* '()
         mezzano.network.ip::*ipv4-interfaces* '()
+        mezzano.network.ip::*outstanding-sends* '()
         mezzano.network.arp::*arp-table* '()
         *hosts* `(("localhost" ,(mezzano.network.ip:make-ipv4-address '(127 0 0 1)))))
   (net-setup)

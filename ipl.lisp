@@ -46,12 +46,16 @@ Make sure there is a virtio-net NIC attached.~%")
            (mezzano.network.ip:address-network fs-address 24)
            (mezzano.network.ip:make-ipv4-address "10.0.2.0"))
       (format t "Warning! This is on a 10/8 network and is not supported.~%"))
+    (when (mezzano.network.ip:address-equal
+           fs-address
+           (mezzano.network.ip:make-ipv4-address "127.0.0.1"))
+      (format t "Warning! This is the local loopback address, and is probably not what you want.~%"))
     (format t "Pinging file server host... ")
     (finish-output)
     (cond ((mezzano.network.ip:ping-host sys.int::*file-server-host-ip* :quiet t)
            (format t "OK!~%"))
           (t
-           (format t "Failed! No responses received!~%"))))
+           (format t "Failed! No responses received! This may not be reliable.~%"))))
   ;; Try basic access to the file server. Just enough to talk to it.
   (format t "Testing access to file server... ")
   (finish-output)
@@ -67,7 +71,7 @@ Make sure there is a virtio-net NIC attached.~%")
            (format t "OK!~%")
            (format t "Has address ~A.~%" goog))
           (t
-           (format t "Failed! Unable to resolve!~%")))))
+           (format t "Failed! Unable to resolve! This may not be reliable.~%")))))
 
 (sys.int::check-connectivity)
 
@@ -95,7 +99,7 @@ Make sure there is a virtio-net NIC attached.~%")
 ;; Other stuff.
 ;; The desktop image, this can be removed or replaced.
 ;; If it is removed, then the line below that starts the desktop must be updated.
-(sys.int::copy-file (merge-pathnames "Hypothymis_azurea_-_Kaeng_Krachan.jpg" (user-homedir-pathname))
+(sys.int::copy-file (merge-pathnames "Ducks.jpg" (user-homedir-pathname))
                     "LOCAL:>Desktop.jpeg"
                     '(unsigned-byte 8))
 
@@ -114,15 +118,42 @@ Make sure there is a virtio-net NIC attached.~%")
 ;; TCE is required for Chipz's decompressor.
 (let ((sys.c::*perform-tce* t)
       ;; Prevent extremely excessive inlining.
-      (sys.c::*constprop-lambda-copy-limit* -1))
+      (sys.c::*constprop-lambda-copy-limit* -1)
+      ;; This inhibits TCE when enabled.
+      (sys.c::*verify-special-stack* nil))
   (require :chipz))
 (require :png-read)
 (require :cl-jpeg)
+(require :skippy)
+(require :cl-video)
+(require :cl-video-avi)
+(require :cl-video-gif)
+(require :cl-video-wav)
+(require :cl-wav)
 (require :swank)
 (eval (read-from-string "(swank:create-server :style :spawn :dont-close t)"))
 
 ;; And the GUI.
 (sys.int::cal "sys:source;gui;font.lisp")
+(sys.int::cal "sys:source;gui;image.lisp")
+
+;: Mouse cursors.
+(flet ((load-cursor (path name &optional (hot-x 0) (hot-y 0))
+         (let ((surf (funcall (read-from-string "mezzano.gui.image:load-image")
+                              (merge-pathnames path "LOCAL:>Icons>"))))
+           (mezzano.gui.compositor:register-mouse-cursor
+            (mezzano.gui.compositor:make-mouse-cursor surf :hot-x hot-x :hot-y hot-y)
+            name))))
+  (load-cursor "cursor-upleft.png"    :arrow-up-left     0   0)
+  (load-cursor "cursor-upright.png"   :arrow-up-right    15  0)
+  (load-cursor "cursor-downright.png" :arrow-down-right  15 15)
+  (load-cursor "cursor-downleft.png"  :arrow-down-left   0  15)
+  (load-cursor "cursor-up.png"        :arrow-up          8   0)
+  (load-cursor "cursor-right.png"     :arrow-right       15  8)
+  (load-cursor "cursor-down.png"      :arrow-down        8  15)
+  (load-cursor "cursor-left.png"      :arrow-left        0   8))
+
+;; Remaining GUI files.
 (sys.int::cal "sys:source;gui;widgets.lisp")
 (sys.int::cal "sys:source;line-edit-mixin.lisp")
 (sys.int::cal "sys:source;gui;popup-io-stream.lisp")
@@ -135,12 +166,14 @@ Make sure there is a virtio-net NIC attached.~%")
 (sys.int::cal "sys:source;applications;fancy-repl.lisp")
 (sys.int::cal "sys:source;gui;desktop.lisp")
 (sys.int::cal "sys:source;gui;image-viewer.lisp")
+(sys.int::cal "sys:source;gui;trentino.lisp")
+(sys.int::cal "sys:source;gui;music-player.lisp")
 (sys.int::cal "sys:source;applications;filer.lisp")
 (sys.int::cal "sys:source;applications;memory-monitor.lisp")
 (sys.int::cal "sys:source;file;http.lisp")
 ;; If the desktop image was removed above, then remove the :IMAGE argument
 ;; from here.
-(setf sys.int::*desktop* (eval (read-from-string "(mezzano.gui.desktop:spawn :image \"LOCAL:>Desktop.jpeg\")")))
+(defvar sys.int::*desktop* (eval (read-from-string "(mezzano.gui.desktop:spawn :image \"LOCAL:>Desktop.jpeg\")")))
 
 (defvar sys.int::*init-file-path* "SYS:HOME;INIT.LISP")
 

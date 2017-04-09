@@ -1,14 +1,28 @@
-;;;; Copyright (c) 2011-2016 Henry Harrington <henry.harrington@gmail.com>
+;;;; Copyright (c) 2011-2017 Henry Harrington <henry.harrington@gmail.com>
 ;;;; This code is licensed under the MIT license.
 
 (in-package :sys.c)
 
 (defvar *should-inline-functions* t)
 
+(defparameter *perform-tce* nil
+  "When true, attempt to eliminate tail calls.")
+
+(defparameter *suppress-builtins* nil
+  "When true, the built-in functions will not be used and full calls will
+be generated instead.")
+
+(defparameter *enable-branch-tensioner* t)
+(defparameter *enable-stack-alignment-checking* nil)
+(defparameter *trace-asm* nil)
+
 (defvar *jump-table-size-min* 4)
 (defvar *jump-table-size-max* 64)
 
 (defvar *load-time-value-hook*)
+
+(defvar *optimize-restrictions* '())
+(defvar *optimize-policy* '(safety 3 debug 3))
 
 (defun parse-declares (forms)
   "Extract any leading declare forms.
@@ -18,19 +32,31 @@ A list of any declaration-specifiers."
   (do ((declares '())
        (itr forms (cdr itr)))
       ((or (null itr)
-	   ;; Stop when (car itr) is not a declare form.
-	   (not (and (consp (car itr))
-		     (eq 'declare (caar itr)))))
+           ;; Stop when (car itr) is not a declare form.
+           (not (and (consp (car itr))
+                     (eq 'declare (caar itr)))))
        (values itr (nreverse declares)))
     ;; Dump the bodies of each declare form into a single list.
     (dolist (decl (cdar itr))
       (push decl declares))))
 
-(defun compile-lambda (lambda &optional env)
-  (codegen-lambda (compile-lambda-1 lambda env)))
+(defun compile-lambda (lambda &optional env target-architecture)
+  (codegen-lambda (compile-lambda-1 lambda env target-architecture) target-architecture))
+
+(defun default-architecture (architecture)
+  (or architecture
+      #+x86-64 :x86-64
+      #+arm64 :arm64))
+
+(defun codegen-lambda (lambda &optional target-architecture)
+  (ecase (default-architecture target-architecture)
+    (:x86-64
+     (mezzano.compiler.codegen.x86-64:codegen-lambda lambda))
+    (:arm64
+     (mezzano.compiler.codegen.arm64:codegen-lambda lambda))))
 
 ;; Parse lambda and optimize, but do not do codegen.
-(defun compile-lambda-1 (lambda &optional env)
+(defun compile-lambda-1 (lambda &optional env target-architecture)
   (detect-uses
    (simplify
     (detect-uses
@@ -46,7 +72,8 @@ A list of any declaration-specifiers."
            (lower-arguments
             (detect-uses
              (run-optimizers
-              (pass1-lambda lambda env))))))))))))))
+              (pass1-lambda lambda env)
+              (default-architecture target-architecture))))))))))))))
 
 (defun eval-load-time-value (form read-only-p)
   (declare (ignore read-only-p))
@@ -87,14 +114,24 @@ A list of any declaration-specifiers."
              *change-count*)
     (incf *change-count*)))
 
-(defun run-optimizers (form)
+(defun optimize-quality-1 (qualities quality)
+  (max (getf *optimize-restrictions* quality 0)
+       (or (getf qualities quality nil)
+           (getf *optimize-policy* quality 0))))
+
+(defun optimize-quality (ast-node quality)
+  (optimize-quality-1 (ast-optimize ast-node) quality))
+
+(defun run-optimizers (form target-architecture)
+  (when (eql (optimize-quality form 'compiliation-speed) 3)
+    (return-from run-optimizers form))
   (dotimes (i 20 (progn (warn 'sys.int::simple-style-warning
-			      :format-control "Possible optimizer infinite loop."
-			      :format-arguments '())
-			form))
+                              :format-control "Possible optimizer infinite loop."
+                              :format-arguments '())
+                        form))
     (let ((*change-count* 0))
       ;; Must be run before lift.
-      (setf form (inline-functions (detect-uses form)))
+      (setf form (inline-functions (detect-uses form) target-architecture))
       (setf form (lambda-lift (detect-uses form)))
       ;; Key arg conversion must be performed after lambda-lifting, so as not to
       ;; complicate the lift code.
@@ -104,6 +141,20 @@ A list of any declaration-specifiers."
       (setf form (kill-temporaries (detect-uses form)))
       (setf form (value-aware-lowering (detect-uses form)))
       (setf form (simplify-control-flow (detect-uses form)))
+      (setf form (blexit (detect-uses form)))
+      (setf form (apply-transforms (detect-uses form) target-architecture))
       (detect-uses form)
       (when (eql *change-count* 0)
-	(return form)))))
+        (return form)))))
+
+(defun fixnump (object)
+  (typep object '(signed-byte 63)))
+
+(defun error-program-error (format-control &rest format-arguments)
+  (error 'sys.int::simple-program-error
+         :format-control format-control
+         :format-arguments format-arguments))
+
+;; A wrapper around SUBTYPEP that can be traced safely.
+(defun compiler-subtypep (type-1 type-2 &optional environment)
+  (subtypep type-1 type-2 environment))

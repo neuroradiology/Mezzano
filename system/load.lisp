@@ -10,6 +10,7 @@
 (defvar *load-truename* nil)
 
 (defvar *modules* '())
+(defvar *module-provider-functions* '())
 (defvar *require-hooks* '())
 
 (defvar *noisy-load* nil)
@@ -25,10 +26,7 @@
     (#.+llf-uninterned-symbol+ 'uninterned-symbol)
     (#.+llf-unbound+ 'unbound)
     (#.+llf-string+ 'string)
-    (#.+llf-setf-symbol+ 'setf-symbol)
     (#.+llf-integer+ 'integer)
-    (#.+llf-invoke+ 'invoke)
-    (#.+llf-setf-fdefinition+ 'setf-fdefinition)
     (#.+llf-simple-vector+ 'simple-vector)
     (#.+llf-character+ 'character)
     (#.+llf-character-with-bits+ 'character-with-bits)
@@ -41,12 +39,22 @@
     (#.+llf-add-backlink+ 'add-backlink)
     (#.+llf-ratio+ 'ratio)
     (#.+llf-array+ 'array)
-    (#.+llf-funcall+ 'funcall)
     (#.+llf-bit-vector+ 'bit-vector)
     (#.+llf-function-reference+ 'function-reference)
     (#.+llf-byte+ 'byte)
     (#.+llf-double-float+ 'double-float)
-    (#.+llf-typed-array+ 'typed-array)))
+    (#.+llf-typed-array+ 'typed-array)
+    (#.+llf-funcall-n+ 'funcall-n)
+    (#.+llf-drop+ 'drop)
+    (#.+llf-complex-rational+ 'complex-rational)
+    (#.+llf-complex-single-float+ 'complex-single-float)
+    (#.+llf-complex-double-float+ 'complex-double-float)))
+
+(defun llf-architecture-name (id)
+  (case id
+    (#.+llf-arch-x86-64+ :x86-64)
+    (#.+llf-arch-arm64+ :arm64)
+    (t :unknown)))
 
 (defun check-llf-header (stream)
   (assert (and (eql (%read-byte stream) #x4C)
@@ -60,7 +68,13 @@
     (assert (eql version *llf-version*)
             ()
             "Bad LLF version ~D, wanted version ~D, while loading ~S."
-            version *llf-version* stream)))
+            version *llf-version* stream))
+  (let ((arch (llf-architecture-name (load-integer stream))))
+    (assert (eql arch
+                 #+x86-64 :x86-64
+                 #+arm64 :arm64) ()
+            "LLF compiled for wrong architecture ~S. Wanted ~S."
+            arch (current-architecture))))
 
 (defun load-integer (stream)
   (let ((value 0) (shift 0))
@@ -231,15 +245,6 @@
     (#.+llf-unbound+ *magic-unbound-value*)
     (#.+llf-string+ (load-string stream))
     (#.+llf-integer+ (load-integer stream))
-    (#.+llf-invoke+
-     (let ((fn (vector-pop stack)))
-       (funcall fn))
-     (values))
-    (#.+llf-setf-fdefinition+
-     (let ((name (vector-pop stack))
-           (fn (vector-pop stack)))
-       (setf (fdefinition name) fn))
-     (values))
     (#.+llf-simple-vector+
      (load-llf-vector stream stack))
     (#.+llf-character+ (load-character stream))
@@ -277,8 +282,6 @@
        (/ num denom)))
     (#.+llf-array+
      (load-llf-array stream stack))
-    (#.+llf-funcall+
-     (values (funcall (vector-pop stack))))
     (#.+llf-bit-vector+
      (let* ((len (load-integer stream))
             (n-octets (ceiling len 8))
@@ -296,7 +299,36 @@
      (byte (load-integer stream)
            (load-integer stream)))
     (#.+llf-typed-array+
-     (load-llf-typed-array stream stack))))
+     (load-llf-typed-array stream stack))
+    (#.+llf-funcall-n+
+     (let* ((n-args (vector-pop stack))
+            (fn (vector-pop stack))
+            (args (reverse (loop
+                              repeat n-args
+                              collect (vector-pop stack)))))
+       (values (apply (if (functionp fn)
+                          fn
+                          (fdefinition fn))
+                      args))))
+    (#.+llf-drop+
+     (vector-pop stack)
+     (values))
+    (#.+llf-complex-rational+
+     (let* ((realpart-numerator (load-integer stream))
+            (realpart-denominator (load-integer stream))
+            (realpart (/ realpart-numerator realpart-denominator))
+            (imagpart-numerator (load-integer stream))
+            (imagpart-denominator (load-integer stream))
+            (imagpart (/ imagpart-numerator imagpart-denominator)))
+       (complex realpart imagpart)))
+    (#.+llf-complex-single-float+
+     (let ((realpart (%integer-as-single-float (load-integer stream)))
+           (imagpart (%integer-as-single-float (load-integer stream))))
+       (complex realpart imagpart)))
+    (#.+llf-complex-double-float+
+     (let ((realpart (%integer-as-double-float (load-integer stream)))
+           (imagpart (%integer-as-double-float (load-integer stream))))
+       (complex realpart imagpart)))))
 
 (defun load-llf (stream &optional (*load-wired* nil))
   (check-llf-header stream)
@@ -306,6 +338,10 @@
     (loop (let ((command (%read-byte stream)))
             (case command
               (#.+llf-end-of-load+
+               (when *noisy-load*
+                 (format t "END-OF-LOAD~%"))
+               (when (not (eql (length stack) 0))
+                 (error "Bug! Stack not empty after LLF load."))
                (return))
               (#.+llf-backlink+
                (let ((id (load-integer stream)))
@@ -396,7 +432,8 @@
             (dolist (pathname pathname-list)
               (load pathname))
             (load pathname-list))
-        (dolist (hook *require-hooks*
+        (dolist (hook (append *module-provider-functions*
+                              *require-hooks*)
                  (error "Unable to REQUIRE module ~A." module-name))
           (when (funcall hook module-name)
             (return)))))

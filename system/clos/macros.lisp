@@ -133,7 +133,7 @@
     (:documentation
      `(:documentation ',(second option)))
     (t
-     `(,(first option) ',(rest option)))))
+     `(',(first option) ',(rest option)))))
 
 (defun canonicalize-defclass-default-initargs (initargs)
   (check-plist initargs)
@@ -249,28 +249,64 @@
 (defun compute-method-lambda (lambda-list qualifiers specializers body fn-spec)
   (multiple-value-bind (forms declares docstring)
       (sys.int::parse-declares body :permit-docstring t)
-    (let ((form (list* 'block
-                       (if (consp fn-spec)
-                           (cadr fn-spec)
-                           fn-spec)
-                       forms)))
-      `(lambda (args next-emfun)
-         (declare (system:lambda-name (defmethod ,fn-spec ,@qualifiers ,specializers)))
-         ,@(when docstring (list docstring))
-         (flet ((call-next-method (&rest cnm-args)
-                  (if (null next-emfun)
-                      (error "No next method.")
-                      (funcall next-emfun (or cnm-args args))))
-                (next-method-p ()
-                  (not (null next-emfun))))
-           (apply (lambda ,(kludge-arglist lambda-list)
-                    (declare ,@declares)
-                    ,form)
-                  args))))))
+    (let* ((form (list* 'block
+                        (if (consp fn-spec)
+                            (cadr fn-spec)
+                            fn-spec)
+                        forms))
+           (ll (analyze-lambda-list lambda-list))
+           (req-args (loop
+                        for name in (getf ll :required-names)
+                        collect (gensym (string name))))
+           (optional-args-p (not (endp (getf ll :optional-args))))
+           (rest-arg (if (or optional-args-p
+                             (member '&rest lambda-list)
+                             (member '&key lambda-list))
+                         (gensym "REST")
+                         nil))
+           (incoming-lambda-list (append req-args
+                                         (if rest-arg
+                                             `(&rest ,rest-arg)
+                                             `()))))
+      `(lambda (method next-emfun)
+         (lambda ,incoming-lambda-list
+           (declare (sys.int::lambda-name (defmethod ,fn-spec ,@qualifiers ,specializers)))
+           ,@(when docstring (list docstring))
+           (flet ((call-next-method (&rest cnm-args)
+                    (if cnm-args
+                        (if next-emfun
+                            (apply next-emfun cnm-args)
+                            (apply #'invoke-no-next-method method cnm-args))
+                        (if next-emfun
+                            ,(cond (rest-arg
+                                    `(apply next-emfun ,@req-args ,rest-arg))
+                                   (t
+                                    `(funcall next-emfun ,@req-args)))
+                            ,(cond (rest-arg
+                                    `(apply #'invoke-no-next-method method ,@req-args ,rest-arg))
+                                   (t
+                                    `(funcall #'invoke-no-next-method method ,@req-args))))))
+                  (next-method-p ()
+                    (not (null next-emfun))))
+             ,(cond (rest-arg
+                     `(apply (lambda ,(kludge-arglist lambda-list)
+                               (declare (ignorable ,@(getf (analyze-lambda-list lambda-list) :required-names))
+                                        ,@declares)
+                               ,form)
+                             ,@req-args
+                             ,rest-arg))
+                    (t
+                     `(funcall (lambda ,(kludge-arglist lambda-list)
+                                 (declare (ignorable ,@(getf (analyze-lambda-list lambda-list) :required-names))
+                                          ,@declares)
+                                 ,form)
+                               ,@req-args)))))))))
 
 ;;; N.B. The function kludge-arglist is used to pave over the differences
 ;;; between argument keyword compatibility for regular functions versus
 ;;; generic functions.
+;;; TODO: This needs to examine the generic function's lambda list to
+;;; determine if &allow-other-keys must be added.
 
 (defun kludge-arglist (lambda-list)
   (let* ((plist (analyze-lambda-list lambda-list))

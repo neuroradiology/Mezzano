@@ -90,12 +90,20 @@
      (error "Type specifier ~S is not a subtype of REAL." typespec))))
 
 (defun expt (base power)
-  (check-type power integer)
-  (cond ((minusp power)
-         (/ (expt base (- power))))
-        (t (let ((accum 1))
-             (dotimes (i power accum)
-               (setf accum (* accum base)))))))
+  (etypecase power
+    (integer
+     (cond ((minusp power)
+            (/ (expt base (- power))))
+           (t (let ((accum 1))
+                (dotimes (i power accum)
+                  (setf accum (* accum base)))))))
+    (float
+     (cond ((eql (float (truncate power) power) power)
+            ;; Moderately integer-like?
+            (expt base (truncate power)))
+           (t
+            ;; Slower...
+            (exp (* power (log base))))))))
 
 (defstruct (large-byte (:constructor make-large-byte (size position)))
   (size 0 :type (integer 0) :read-only t)
@@ -225,22 +233,6 @@
        (and (eql exp #x7FF)
             (zerop sig))))))
 
-(define-lap-function %single-float-as-integer ()
-  (sys.lap-x86:mov64 :rax :r8)
-  (sys.lap-x86:shr64 :rax 32)
-  (sys.lap-x86:shl64 :rax #.sys.int::+n-fixnum-bits+)
-  (sys.lap-x86:mov64 :r8 :rax)
-  (sys.lap-x86:mov32 :ecx #.(ash 1 sys.int::+n-fixnum-bits+))
-  (sys.lap-x86:ret))
-
-(define-lap-function %integer-as-single-float ()
-  (sys.lap-x86:mov64 :rax :r8)
-  (sys.lap-x86:shr64 :rax #.sys.int::+n-fixnum-bits+)
-  (sys.lap-x86:shl64 :rax 32)
-  (sys.lap-x86:lea64 :r8 (:rax #.sys.int::+tag-single-float+))
-  (sys.lap-x86:mov32 :ecx #.(ash 1 sys.int::+n-fixnum-bits+))
-  (sys.lap-x86:ret))
-
 (defun %double-float-as-integer (double-float)
   (%object-ref-unsigned-byte-64 double-float 0))
 
@@ -282,57 +274,6 @@
 (defun mezzano.runtime::%%coerce-bignum-to-double-float (bignum)
   (bignum-to-float bignum 0.0d0 53))
 
-(define-lap-function %%bignum-< ()
-  ;; Read lengths.
-  (sys.lap-x86:mov64 :rax (:r8 #.(- +tag-object+)))
-  (sys.lap-x86:mov64 :rdx (:r9 #.(- +tag-object+)))
-  (sys.lap-x86:shr64 :rax #.+object-data-shift+)
-  (sys.lap-x86:shr64 :rdx #.+object-data-shift+)
-  ;; Pick the longest length.
-  (sys.lap-x86:mov64 :rcx :rax)
-  (sys.lap-x86:cmp64 :rax :rdx)
-  (sys.lap-x86:cmov64ng :rcx :rdx)
-  (sys.lap-x86:xor64 :rbx :rbx) ; offset
-  (sys.lap-x86:xor64 :r10 :r10) ; CF save register.
-  (sys.lap-x86:shl64 :rax 3)
-  (sys.lap-x86:shl64 :rdx 3)
-  loop
-  (sys.lap-x86:cmp64 :rbx :rax)
-  (sys.lap-x86:jae sx-left)
-  (sys.lap-x86:mov64 :rsi (:r8 #.(+ (- +tag-object+) 8) :rbx))
-  sx-left-resume
-  (sys.lap-x86:cmp64 :rbx :rdx)
-  (sys.lap-x86:jae sx-right)
-  (sys.lap-x86:mov64 :rdi (:r9 #.(+ (- +tag-object+) 8) :rbx))
-  sx-right-resume
-  (sys.lap-x86:add64 :rbx 8)
-  (sys.lap-x86:sub64 :rcx 1)
-  (sys.lap-x86:jz last-compare)
-  (sys.lap-x86:clc) ; Avoid setting low bits in r10.
-  (sys.lap-x86:rcl64 :r10 1) ; Restore saved carry.
-  (sys.lap-x86:sbb64 :rsi :rdi)
-  (sys.lap-x86:rcr64 :r10 1) ; Save carry.
-  (sys.lap-x86:jmp loop)
-  last-compare
-  (sys.lap-x86:clc) ; Avoid setting low bits in r10.
-  (sys.lap-x86:rcl64 :r10 1) ; Restore saved carry.
-  (sys.lap-x86:sbb64 :rsi :rdi)
-  (sys.lap-x86:mov64 :r8 nil)
-  (sys.lap-x86:mov64 :r9 t)
-  (sys.lap-x86:cmov64l :r8 :r9)
-  (sys.lap-x86:mov32 :ecx #.(ash 1 +n-fixnum-bits+))
-  (sys.lap-x86:ret)
-  sx-left
-  ;; Sign extend the left argument.
-  ;; Previous value is not in RSI. Pull from the last word in the bignum.
-  (sys.lap-x86:mov64 :rsi (:r8 #.(- +tag-object+) :rax))
-  (sys.lap-x86:sar64 :rsi 63)
-  (sys.lap-x86:jmp sx-left-resume)
-  sx-right
-  ;; Sign extend the right argument (previous value in RDI).
-  (sys.lap-x86:sar64 :rdi 63)
-  (sys.lap-x86:jmp sx-right-resume))
-
 (declaim (inline call-with-float-contagion))
 (defun call-with-float-contagion (x y single-fn double-fn)
   (if (or (double-float-p x)
@@ -370,30 +311,6 @@
           (* (numerator y) (denominator x))))
     (t (error "TODO... Argument combination ~S and ~S not supported." x y))))
 
-(define-lap-function %%bignum-= ()
-  ;; Read headers.
-  (sys.lap-x86:mov64 :rax (:r8 #.(- +tag-object+)))
-  (sys.lap-x86:cmp64 :rax (:r9 #.(- +tag-object+)))
-  (sys.lap-x86:jne different)
-  ;; Same length, compare words.
-  (sys.lap-x86:shr64 :rax #.+object-data-shift+)
-  (sys.lap-x86:xor32 :ecx :ecx)
-  loop
-  (sys.lap-x86:mov64 :rdx (:r8 #.(+ (- +tag-object+) 8) (:rcx 8)))
-  (sys.lap-x86:cmp64 :rdx (:r9 #.(+ (- +tag-object+) 8) (:rcx 8)))
-  (sys.lap-x86:jne different)
-  test
-  (sys.lap-x86:add64 :rcx 1)
-  (sys.lap-x86:cmp64 :rcx :rax)
-  (sys.lap-x86:jb loop)
-  (sys.lap-x86:mov64 :r8 t)
-  done
-  (sys.lap-x86:mov32 :ecx #.(ash 1 +n-fixnum-bits+))
-  (sys.lap-x86:ret)
-  different
-  (sys.lap-x86:mov64 :r8 nil)
-  (sys.lap-x86:jmp done))
-
 (defun sys.int::full-= (x y)
   (check-type x number)
   (check-type y number)
@@ -428,7 +345,8 @@ Implements the dumb mp_div algorithm from BigNum Math."
   (let ((ta (abs a))
         (tb (abs b))
         (tq 1)
-        (q 0))
+        (q 0)
+        (n nil))
     ;; Check for the easy case. |a| < |b| => 0, a
     (when (< ta tb)
       (return-from %%bignum-truncate
@@ -529,105 +447,6 @@ Implements the dumb mp_div algorithm from BigNum Math."
             (* (denominator x) (numerator y))))
         (t (error "Argument complex ~S and ~S not supported." x y))))
 
-(define-lap-function %%bignum-+ ()
-  (sys.lap-x86:push :rbp)
-  (:gc :no-frame :layout #*0)
-  (sys.lap-x86:mov64 :rbp :rsp)
-  (:gc :frame)
-  (sys.lap-x86:push :r8)
-  (:gc :frame :layout #*1)
-  (sys.lap-x86:push :r9)
-  (:gc :frame :layout #*11)
-  ;; Read lengths.
-  (sys.lap-x86:mov64 :rax (:r8 #.(- +tag-object+)))
-  (sys.lap-x86:mov64 :rdx (:r9 #.(- +tag-object+)))
-  (sys.lap-x86:shr64 :rax #.+object-data-shift+)
-  (sys.lap-x86:shr64 :rdx #.+object-data-shift+)
-  ;; Allocate a new bignum large enough to hold the result.
-  (sys.lap-x86:cmp32 :eax :edx)
-  (sys.lap-x86:cmov32na :eax :edx)
-  (sys.lap-x86:add32 :eax 1)
-  (sys.lap-x86:jc bignum-overflow)
-  (sys.lap-x86:mov64 :rcx #.(ash 1 +n-fixnum-bits+)) ; fixnum 1
-  (sys.lap-x86:lea64 :r8 ((:rax #.(ash 1 +n-fixnum-bits+)))) ; fixnumize
-  (sys.lap-x86:mov64 :r13 (:function %make-bignum-of-length))
-  (sys.lap-x86:call (:r13 #.(+ (- sys.int::+tag-object+)
-                               8
-                               (* sys.int::+fref-entry-point+ 8))))
-  (sys.lap-x86:mov64 :r10 :r8)
-  ;; Reread lengths.
-  (sys.lap-x86:mov64 :r9 (:stack 1))
-  (sys.lap-x86:mov64 :r8 (:stack 0))
-  (:gc :frame)
-  (sys.lap-x86:mov64 :rax (:r8 #.(- +tag-object+)))
-  (sys.lap-x86:mov64 :rdx (:r9 #.(- +tag-object+)))
-  (sys.lap-x86:shr64 :rax #.+object-data-shift+)
-  (sys.lap-x86:shr64 :rdx #.+object-data-shift+)
-  ;; X in r8. Y in r9. Result in r10.
-  ;; Pick the longest length.
-  (sys.lap-x86:mov64 :rcx :rax)
-  (sys.lap-x86:cmp64 :rax :rdx)
-  (sys.lap-x86:cmov64ng :rcx :rdx)
-  (sys.lap-x86:xor64 :rbx :rbx) ; offset
-  (sys.lap-x86:xor64 :r11 :r11) ; CF save register.
-  (sys.lap-x86:shl64 :rax 3)
-  (sys.lap-x86:shl64 :rdx 3)
-  loop
-  (sys.lap-x86:cmp64 :rbx :rax)
-  (sys.lap-x86:jae sx-left)
-  (sys.lap-x86:mov64 :rsi (:r8 #.(+ (- +tag-object+) 8) :rbx))
-  sx-left-resume
-  (sys.lap-x86:cmp64 :rbx :rdx)
-  (sys.lap-x86:jae sx-right)
-  (sys.lap-x86:mov64 :rdi (:r9 #.(+ (- +tag-object+) 8) :rbx))
-  sx-right-resume
-  (sys.lap-x86:add64 :rbx 8)
-  (sys.lap-x86:sub64 :rcx 1)
-  (sys.lap-x86:jz last)
-  (sys.lap-x86:clc) ; Avoid setting low bits in r11.
-  (sys.lap-x86:rcl64 :r11 1) ; Restore saved carry.
-  (sys.lap-x86:adc64 :rsi :rdi)
-  (sys.lap-x86:mov64 (:r10 #.(- +tag-object+) :rbx) :rsi)
-  (sys.lap-x86:rcr64 :r11 1) ; Save carry.
-  (sys.lap-x86:jmp loop)
-  last
-  (sys.lap-x86:clc) ; Avoid setting low bits in r11.
-  (sys.lap-x86:rcl64 :r11 1) ; Restore saved carry.
-  (sys.lap-x86:adc64 :rsi :rdi)
-  (sys.lap-x86:mov64 (:r10 #.(- +tag-object+) :rbx) :rsi)
-  (sys.lap-x86:jo sign-changed)
-  ;; Sign didn't change.
-  (sys.lap-x86:sar64 :rsi 63)
-  sign-fixed
-  (sys.lap-x86:mov64 (:r10 #.(+ (- +tag-object+) 8) :rbx) :rsi)
-  (sys.lap-x86:mov64 :r8 :r10)
-  (sys.lap-x86:mov32 :ecx #.(ash 1 +n-fixnum-bits+))
-  (sys.lap-x86:mov64 :r13 (:function %%canonicalize-bignum))
-  (sys.lap-x86:leave)
-  (:gc :no-frame)
-  (sys.lap-x86:jmp (:r13 #.(+ (- sys.int::+tag-object+) 8 (* sys.int::+fref-entry-point+ 8))))
-  (:gc :frame)
-  sx-left
-  ;; Sign extend the left argument.
-  ;; Previous value is not in RSI. Pull from the last word in the bignum.
-  (sys.lap-x86:mov64 :rsi (:r8 #.(- +tag-object+) :rax))
-  (sys.lap-x86:sar64 :rsi 63)
-  (sys.lap-x86:jmp sx-left-resume)
-  sx-right
-  ;; Sign extend the right argument (previous value in RDI).
-  (sys.lap-x86:sar64 :rdi 63)
-  (sys.lap-x86:jmp sx-right-resume)
-  sign-changed
-  (sys.lap-x86:rcr64 :rsi 1)
-  (sys.lap-x86:sar64 :rsi 63)
-  (sys.lap-x86:jmp sign-fixed)
-  bignum-overflow
-  (sys.lap-x86:mov64 :r8 (:constant "Aiee! Bignum overflow."))
-  (sys.lap-x86:mov64 :r13 (:function error))
-  (sys.lap-x86:mov32 :ecx #.(ash 1 +n-fixnum-bits+))
-  (sys.lap-x86:call (:r13 #.(+ (- sys.int::+tag-object+) 8 (* sys.int::+fref-entry-point+ 8))))
-  (sys.lap-x86:ud2))
-
 (defun sys.int::full-+ (x y)
   (cond ((and (sys.int::fixnump x)
               (sys.int::fixnump y))
@@ -657,104 +476,6 @@ Implements the dumb mp_div algorithm from BigNum Math."
            (check-type y number)
            (error "Argument combination ~S and ~S not supported." x y))))
 
-(define-lap-function %%bignum-- ()
-  (sys.lap-x86:push :rbp)
-  (:gc :no-frame :layout #*0)
-  (sys.lap-x86:mov64 :rbp :rsp)
-  (:gc :frame)
-  (sys.lap-x86:push :r8)
-  (:gc :frame :layout #*1)
-  (sys.lap-x86:push :r9)
-  (:gc :frame :layout #*11)
-  ;; Read lengths.
-  (sys.lap-x86:mov64 :rax (:r8 #.(- +tag-object+)))
-  (sys.lap-x86:mov64 :rdx (:r9 #.(- +tag-object+)))
-  (sys.lap-x86:shr64 :rax #.+object-data-shift+)
-  (sys.lap-x86:shr64 :rdx #.+object-data-shift+)
-  ;; Allocate a new bignum large enough to hold the result.
-  (sys.lap-x86:cmp64 :rax :rdx)
-  (sys.lap-x86:cmov64ng :rax :rdx)
-  (sys.lap-x86:add32 :eax 1)
-  (sys.lap-x86:jc bignum-overflow)
-  (sys.lap-x86:mov64 :rcx #.(ash 1 +n-fixnum-bits+)) ; fixnum 1
-  (sys.lap-x86:lea64 :r8 ((:rax #.(ash 1 +n-fixnum-bits+)))) ; fixnumize
-  (sys.lap-x86:mov64 :r13 (:function %make-bignum-of-length))
-  (sys.lap-x86:call (:r13 #.(+ (- sys.int::+tag-object+) 8 (* sys.int::+fref-entry-point+ 8))))
-  (sys.lap-x86:mov64 :r10 :r8)
-  ;; Reread lengths.
-  (sys.lap-x86:mov64 :r9 (:stack 1))
-  (sys.lap-x86:mov64 :r8 (:stack 0))
-  (:gc :frame)
-  (sys.lap-x86:mov64 :rax (:r8 #.(- +tag-object+)))
-  (sys.lap-x86:mov64 :rdx (:r9 #.(- +tag-object+)))
-  (sys.lap-x86:shr64 :rax 8)
-  (sys.lap-x86:shr64 :rdx 8)
-  ;; X in r8. Y in r9. Result in r10.
-  ;; Pick the longest length.
-  (sys.lap-x86:mov64 :rcx :rax)
-  (sys.lap-x86:cmp64 :rax :rdx)
-  (sys.lap-x86:cmov64ng :rcx :rdx)
-  (sys.lap-x86:xor64 :rbx :rbx) ; offset
-  (sys.lap-x86:xor64 :r11 :r11) ; CF save register.
-  (sys.lap-x86:shl64 :rax 3)
-  (sys.lap-x86:shl64 :rdx 3)
-  loop
-  (sys.lap-x86:cmp64 :rbx :rax)
-  (sys.lap-x86:jae sx-left)
-  (sys.lap-x86:mov64 :rsi (:r8 #.(+ (- +tag-object+) 8) :rbx))
-  sx-left-resume
-  (sys.lap-x86:cmp64 :rbx :rdx)
-  (sys.lap-x86:jae sx-right)
-  (sys.lap-x86:mov64 :rdi (:r9 #.(+ (- +tag-object+) 8) :rbx))
-  sx-right-resume
-  (sys.lap-x86:add64 :rbx 8)
-  (sys.lap-x86:sub64 :rcx 1)
-  (sys.lap-x86:jz last)
-  (sys.lap-x86:clc) ; Avoid setting low bits in r11.
-  (sys.lap-x86:rcl64 :r11 1) ; Restore saved carry.
-  (sys.lap-x86:sbb64 :rsi :rdi)
-  (sys.lap-x86:mov64 (:r10 #.(- +tag-object+) :rbx) :rsi)
-  (sys.lap-x86:rcr64 :r11 1) ; Save carry.
-  (sys.lap-x86:jmp loop)
-  last
-  (sys.lap-x86:clc) ; Avoid setting low bits in r11.
-  (sys.lap-x86:rcl64 :r11 1) ; Restore saved carry.
-  (sys.lap-x86:sbb64 :rsi :rdi)
-  (sys.lap-x86:mov64 (:r10 #.(- +tag-object+) :rbx) :rsi)
-  (sys.lap-x86:jo sign-changed)
-  ;; Sign didn't change.
-  (sys.lap-x86:sar64 :rsi 63)
-  sign-fixed
-  (sys.lap-x86:mov64 (:r10 #.(+ (- +tag-object+) 8) :rbx) :rsi)
-  (sys.lap-x86:mov64 :r8 :r10)
-  (sys.lap-x86:mov32 :ecx #.(ash 1 +n-fixnum-bits+))
-  (sys.lap-x86:mov64 :r13 (:function %%canonicalize-bignum))
-  (sys.lap-x86:leave)
-  (:gc :no-frame)
-  (sys.lap-x86:jmp (:r13 #.(+ (- sys.int::+tag-object+) 8 (* sys.int::+fref-entry-point+ 8))))
-  (:gc :frame)
-  sx-left
-  ;; Sign extend the left argument.
-  ;; Previous value is not in RSI. Pull from the last word in the bignum.
-  (sys.lap-x86:mov64 :rsi (:r8 #.(- +tag-object+) :rax))
-  (sys.lap-x86:sar64 :rsi 63)
-  (sys.lap-x86:jmp sx-left-resume)
-  sx-right
-  ;; Sign extend the right argument (previous value in RDI).
-  (sys.lap-x86:sar64 :rdi 63)
-  (sys.lap-x86:jmp sx-right-resume)
-  sign-changed
-  (sys.lap-x86:cmc)
-  (sys.lap-x86:rcr64 :rsi 1)
-  (sys.lap-x86:sar64 :rsi 63)
-  (sys.lap-x86:jmp sign-fixed)
-  bignum-overflow
-  (sys.lap-x86:mov64 :r8 (:constant "Aiee! Bignum overflow."))
-  (sys.lap-x86:mov64 :r13 (:function error))
-  (sys.lap-x86:mov32 :ecx #.(ash 1 +n-fixnum-bits+))
-  (sys.lap-x86:call (:r13 #.(+ (- sys.int::+tag-object+) 8 (* sys.int::+fref-entry-point+ 8))))
-  (sys.lap-x86:ud2))
-
 (defun sys.int::full-- (x y)
   (cond ((and (sys.int::fixnump x)
               (sys.int::fixnump y))
@@ -783,51 +504,6 @@ Implements the dumb mp_div algorithm from BigNum Math."
         (t (check-type x number)
            (check-type y number)
            (error "Argument combination ~S and ~S not supported." x y))))
-
-;;; Unsigned multiply X & Y, must be of type (UNSIGNED-BYTE 64)
-;;; This can be either a fixnum, a length-one bignum or a length-two bignum.
-;;; Always returns an (UNSIGNED-BYTE 128) in a length-three bignum.
-(define-lap-function %%bignum-multiply-step ()
-  (sys.lap-x86:push :rbp)
-  (:gc :no-frame :layout #*0)
-  (sys.lap-x86:mov64 :rbp :rsp)
-  (:gc :frame)
-  ;; Read X.
-  (sys.lap-x86:test64 :r8 #.+fixnum-tag-mask+)
-  (sys.lap-x86:jnz read-bignum-x)
-  (sys.lap-x86:mov64 :rax :r8)
-  (sys.lap-x86:shr64 :rax #.+n-fixnum-bits+)
-  ;; Read Y.
-  read-y
-  (sys.lap-x86:test64 :r9 #.+fixnum-tag-mask+)
-  (sys.lap-x86:jnz read-bignum-y)
-  (sys.lap-x86:mov64 :rcx :r9)
-  (sys.lap-x86:shr64 :rcx #.+n-fixnum-bits+)
-  perform-multiply
-  (sys.lap-x86:mul64 :rcx)
-  ;; RDX:RAX holds the 128-bit result.
-  ;; Prepare to allocate the result.
-  (sys.lap-x86:push :rdx) ; High half.
-  (sys.lap-x86:push :rax) ; Low half.
-  (sys.lap-x86:mov64 :rcx #.(ash 1 +n-fixnum-bits+)) ; fixnum 1
-  (sys.lap-x86:mov64 :r8 #.(ash 3 +n-fixnum-bits+)) ; fixnum 3
-  (sys.lap-x86:mov64 :r13 (:function %make-bignum-of-length))
-  (sys.lap-x86:call (:r13 #.(+ (- sys.int::+tag-object+) 8 (* sys.int::+fref-entry-point+ 8))))
-  (sys.lap-x86:pop (:r8 #.(+ (- +tag-object+) 8)))
-  (sys.lap-x86:pop (:r8 #.(+ (- +tag-object+) 16)))
-  (sys.lap-x86:mov64 (:r8 #.(+ (- +tag-object+) 24)) 0)
-  ;; Single value return
-  (sys.lap-x86:mov32 :ecx #.(ash 1 +n-fixnum-bits+))
-  (sys.lap-x86:leave)
-  (:gc :no-frame)
-  (sys.lap-x86:ret)
-  (:gc :frame)
-  read-bignum-x
-  (sys.lap-x86:mov64 :rax (:r8 #.(+ (- +tag-object+) 8)))
-  (sys.lap-x86:jmp read-y)
-  read-bignum-y
-  (sys.lap-x86:mov64 :rcx (:r9 #.(+ (- +tag-object+) 8)))
-  (sys.lap-x86:jmp perform-multiply))
 
 (defun %%bignum-multiply-unsigned (a b)
   (assert (bignump a))
@@ -905,206 +581,6 @@ Implements the dumb mp_div algorithm from BigNum Math."
            (check-type y number)
            (error "Argument combination ~S and ~S not supported." x y))))
 
-(macrolet ((def (name bignum-name op)
-             `(progn
-                (define-lap-function ,bignum-name ()
-                  (sys.lap-x86:push :rbp)
-                  (:gc :no-frame :layout #*0)
-                  (sys.lap-x86:mov64 :rbp :rsp)
-                  (:gc :frame)
-                  ;; Save objects.
-                  (sys.lap-x86:push :r8)
-                  (:gc :frame :layout #*1)
-                  (sys.lap-x86:push :r9)
-                  (:gc :frame :layout #*11)
-                  ;; Read lengths.
-                  (sys.lap-x86:mov64 :rax (:r8 #.(- +tag-object+)))
-                  (sys.lap-x86:mov64 :rdx (:r9 #.(- +tag-object+)))
-                  (sys.lap-x86:shr64 :rax #.+object-data-shift+)
-                  (sys.lap-x86:shr64 :rdx #.+object-data-shift+)
-                  ;; Allocate a new bignum large enough to hold the result.
-                  (sys.lap-x86:cmp32 :eax :edx)
-                  (sys.lap-x86:cmov32na :eax :edx)
-                  (sys.lap-x86:mov64 :rcx #.(ash 1 +n-fixnum-bits+)) ; fixnum 1
-                  (sys.lap-x86:lea64 :r8 ((:rax #.(ash 1 +n-fixnum-bits+)))) ; fixnumize
-                  (sys.lap-x86:mov64 :r13 (:function %make-bignum-of-length))
-                  (sys.lap-x86:call (:r13 #.(+ (- sys.int::+tag-object+) 8 (* sys.int::+fref-entry-point+ 8))))
-                  (sys.lap-x86:mov64 :r10 :r8)
-                  ;; Reread lengths.
-                  (sys.lap-x86:mov64 :r9 (:stack 1))
-                  (sys.lap-x86:mov64 :r8 (:stack 0))
-                  (:gc :frame)
-                  (sys.lap-x86:mov64 :rax (:r8 #.(- +tag-object+)))
-                  (sys.lap-x86:mov64 :rdx (:r9 #.(- +tag-object+)))
-                  (sys.lap-x86:shr64 :rax #.+object-data-shift+)
-                  (sys.lap-x86:shr64 :rdx #.+object-data-shift+)
-                  ;; X in r8. Y in r9. Result in r10.
-                  ;; Pick the longest length.
-                  (sys.lap-x86:mov64 :rcx :rax)
-                  (sys.lap-x86:cmp64 :rax :rdx)
-                  (sys.lap-x86:cmov64ng :rcx :rdx)
-                  (sys.lap-x86:xor64 :rbx :rbx) ; offset
-                  (sys.lap-x86:shl64 :rax 3)
-                  (sys.lap-x86:shl64 :rdx 3)
-                  loop
-                  (sys.lap-x86:cmp64 :rbx :rax)
-                  (sys.lap-x86:jae sx-left)
-                  (sys.lap-x86:mov64 :rsi (:r8 #.(+ (- +tag-object+) 8) :rbx))
-                  sx-left-resume
-                  (sys.lap-x86:cmp64 :rbx :rdx)
-                  (sys.lap-x86:jae sx-right)
-                  (sys.lap-x86:mov64 :rdi (:r9 #.(+ (- +tag-object+) 8) :rbx))
-                  sx-right-resume
-                  (sys.lap-x86:add64 :rbx 8)
-                  (sys.lap-x86:sub64 :rcx 1)
-                  (sys.lap-x86:jz last)
-                  (,op :rsi :rdi)
-                  (sys.lap-x86:mov64 (:r10 #.(- +tag-object+) :rbx) :rsi)
-                  (sys.lap-x86:jmp loop)
-                  last
-                  (,op :rsi :rdi)
-                  (sys.lap-x86:mov64 (:r10 #.(- +tag-object+) :rbx) :rsi)
-                  (sys.lap-x86:mov64 :r8 :r10)
-                  (sys.lap-x86:mov32 :ecx #.(ash 1 +n-fixnum-bits+))
-                  (sys.lap-x86:mov64 :r13 (:function %%canonicalize-bignum))
-                  (sys.lap-x86:leave)
-                  (:gc :no-frame)
-                  (sys.lap-x86:jmp (:r13 #.(+ (- sys.int::+tag-object+) 8 (* sys.int::+fref-entry-point+ 8))))
-                  (:gc :frame)
-                  sx-left
-                  ;; Sign extend the left argument.
-                  ;; Previous value is not in RSI. Pull from the last word in the bignum.
-                  (sys.lap-x86:mov64 :rsi (:r8 #.(- +tag-object+) :rax))
-                  (sys.lap-x86:sar64 :rsi 63)
-                  (sys.lap-x86:jmp sx-left-resume)
-                  sx-right
-                  ;; Sign extend the right argument (previous value in RDI).
-                  (sys.lap-x86:sar64 :rdi 63)
-                  (sys.lap-x86:jmp sx-right-resume))
-                (defun ,name (x y)
-                  (cond ((and (fixnump x)
-                              (fixnump y))
-                         (error "FIXNUM/FIXNUM case hit ~S." ',name))
-                        ((and (fixnump x)
-                              (bignump y))
-                         (,bignum-name (%make-bignum-from-fixnum x) y))
-                        ((and (bignump x)
-                              (fixnump y))
-                         (,bignum-name x (%make-bignum-from-fixnum y)))
-                        ((and (bignump x)
-                              (bignump y))
-                         (,bignum-name x y))
-                        (t (check-type x integer)
-                           (check-type y integer)
-                           (error "Argument combination not supported.")))))))
-  (def generic-logand %%bignum-logand sys.lap-x86:and64)
-  (def generic-logior %%bignum-logior sys.lap-x86:or64)
-  (def generic-logxor %%bignum-logxor sys.lap-x86:xor64))
-
-(define-lap-function %%bignum-left-shift ()
-  (sys.lap-x86:push :rbp)
-  (:gc :no-frame :layout #*0)
-  (sys.lap-x86:mov64 :rbp :rsp)
-  ;; Save objects.
-  (sys.lap-x86:push :r8) ; src
-  (:gc :frame :layout #*1)
-  (sys.lap-x86:push :r9) ; count
-  (:gc :frame :layout #*11)
-  ;; Allocate a new bignum large enough to hold the result.
-  (sys.lap-x86:mov64 :rax (:r8 #.(- +tag-object+)))
-  (sys.lap-x86:shr64 :rax #.+object-data-shift+)
-  (sys.lap-x86:mov64 :rcx #.(ash 1 +n-fixnum-bits+)) ; fixnum 1
-  (sys.lap-x86:lea64 :r8 ((:rax #.(ash 1 +n-fixnum-bits+))
-                          #.(ash 1 +n-fixnum-bits+))) ; fixnumize +1
-  (sys.lap-x86:mov64 :r13 (:function %make-bignum-of-length))
-  (sys.lap-x86:call (:r13 #.(+ (- sys.int::+tag-object+) 8 (* sys.int::+fref-entry-point+ 8))))
-  ;; R8: dest
-  ;; R9: src
-  ;; CL: count
-  ;; RBX: n words.
-  ;; R10: current word.
-  (sys.lap-x86:mov64 :rcx (:stack 1))
-  (sys.lap-x86:mov64 :r9 (:stack 0))
-  (:gc :frame)
-  (sys.lap-x86:mov64 :rbx (:r9 #.(- +tag-object+)))
-  (sys.lap-x86:sar64 :rcx #.+n-fixnum-bits+)
-  (sys.lap-x86:and64 :rbx #.(lognot (1- (ash 1 +object-data-shift+))))
-  (sys.lap-x86:shr64 :rbx #.(- +object-data-shift+ +n-fixnum-bits+))
-  (sys.lap-x86:mov32 :r10d #.(ash 1 +n-fixnum-bits+))
-  loop
-  (sys.lap-x86:cmp64 :r10 :rbx)
-  (sys.lap-x86:jae last-word)
-  (sys.lap-x86:mov64 :rax (:r9 #.(+ (- +tag-object+) 8) (:r10 #.(/ 8 (ash 1 +n-fixnum-bits+)))))
-  (sys.lap-x86:mov64 :rdx (:r9 #.(+ (- +tag-object+)) (:r10 #.(/ 8 (ash 1 +n-fixnum-bits+)))))
-  (sys.lap-x86:shld64 :rax :rdx :cl)
-  (sys.lap-x86:mov64 (:r8 #.(+ (- +tag-object+) 8) (:r10 #.(/ 8 (ash 1 +n-fixnum-bits+)))) :rax)
-  (sys.lap-x86:add64 :r10 #.(ash 1 +n-fixnum-bits+))
-  (sys.lap-x86:jmp loop)
-  last-word
-  (sys.lap-x86:mov64 :rax (:r9 #.(- +tag-object+) (:rbx #.(/ 8 (ash 1 +n-fixnum-bits+)))))
-  (sys.lap-x86:cqo)
-  (sys.lap-x86:shld64 :rdx :rax :cl)
-  (sys.lap-x86:mov64 (:r8 #.(+ (- +tag-object+) 8) (:rbx #.(/ 8 (ash 1 +n-fixnum-bits+)))) :rdx)
-  (sys.lap-x86:mov64 :rax (:r9 #.(+ (- +tag-object+) 8)))
-  (sys.lap-x86:shl64 :rax :cl)
-  (sys.lap-x86:mov64 (:r8 #.(+ (- +tag-object+) 8)) :rax)
-  (sys.lap-x86:mov32 :ecx #.(ash 1 +n-fixnum-bits+))
-  (sys.lap-x86:mov64 :r13 (:function %%canonicalize-bignum))
-  (sys.lap-x86:leave)
-  (:gc :no-frame)
-  (sys.lap-x86:jmp (:r13 #.(+ (- sys.int::+tag-object+) 8 (* sys.int::+fref-entry-point+ 8)))))
-
-(define-lap-function %%bignum-right-shift ()
-  (sys.lap-x86:push :rbp)
-  (:gc :no-frame :layout #*0)
-  (sys.lap-x86:mov64 :rbp :rsp)
-  (:gc :frame)
-  ;; Save objects.
-  (sys.lap-x86:push :r8) ; src
-  (:gc :frame :layout #*1)
-  (sys.lap-x86:push :r9) ; count
-  (:gc :frame :layout #*11)
-  ;; Allocate a new bignum large enough to hold the result.
-  (sys.lap-x86:mov64 :rax (:r8 #.(- +tag-object+)))
-  (sys.lap-x86:shr64 :rax #.+object-data-shift+)
-  (sys.lap-x86:mov64 :rcx #.(ash 1 +n-fixnum-bits+)) ; fixnum 1
-  (sys.lap-x86:lea64 :r8 ((:rax #.(ash 1 +n-fixnum-bits+)))) ; fixnumize
-  (sys.lap-x86:mov64 :r13 (:function %make-bignum-of-length))
-  (sys.lap-x86:call (:r13 #.(+ (- sys.int::+tag-object+) 8 (* sys.int::+fref-entry-point+ 8))))
-  ;; R8: dest
-  ;; R9: src
-  ;; CL: count (raw)
-  ;; RBX: n words. (fixnum)
-  ;; R10: current word. (fixnum)
-  (sys.lap-x86:pop :rcx)
-  (sys.lap-x86:pop :r9)
-  (:gc :frame)
-  (sys.lap-x86:sar64 :rcx #.+n-fixnum-bits+)
-  (sys.lap-x86:mov64 :rbx (:r9 #.(- +tag-object+)))
-  (sys.lap-x86:and64 :rbx #.(lognot (1- (ash 1 +object-data-shift+))))
-  (sys.lap-x86:shr64 :rbx #.(- +object-data-shift+ +n-fixnum-bits+))
-  (sys.lap-x86:mov32 :r10d #.(ash 1 +n-fixnum-bits+))
-  loop
-  (sys.lap-x86:cmp64 :r10 :rbx)
-  (sys.lap-x86:jae last-word)
-  ;; current+1
-  (sys.lap-x86:mov64 :rax (:r9 #.(+ (- +tag-object+) 8) (:r10 #.(/ 8 (ash 1 +n-fixnum-bits+)))))
-  ;; current
-  (sys.lap-x86:mov64 :rdx (:r9 #.(- +tag-object+) (:r10 #.(/ 8 (ash 1 +n-fixnum-bits+)))))
-  (sys.lap-x86:shrd64 :rdx :rax :cl)
-  (sys.lap-x86:mov64 (:r8 #.(- +tag-object+) (:r10 #.(/ 8 (ash 1 +n-fixnum-bits+)))) :rdx)
-  (sys.lap-x86:add64 :r10 #.(ash 1 +n-fixnum-bits+))
-  (sys.lap-x86:jmp loop)
-  last-word
-  (sys.lap-x86:mov64 :rax (:r9 #.(- +tag-object+) (:rbx #.(/ 8 (ash 1 +n-fixnum-bits+)))))
-  (sys.lap-x86:sar64 :rax :cl)
-  (sys.lap-x86:mov64 (:r8 #.(- +tag-object+) (:rbx #.(/ 8 (ash 1 +n-fixnum-bits+)))) :rax)
-  (sys.lap-x86:mov32 :ecx #.(ash 1 +n-fixnum-bits+))
-  (sys.lap-x86:mov64 :r13 (:function %%canonicalize-bignum))
-  (sys.lap-x86:leave)
-  (:gc :no-frame)
-  (sys.lap-x86:jmp (:r13 #.(+ (- sys.int::+tag-object+) 8 (* sys.int::+fref-entry-point+ 8)))))
-
 (defun abs (number)
   (check-type number number)
   (etypecase number
@@ -1114,28 +590,6 @@ Implements the dumb mp_div algorithm from BigNum Math."
               (- number)
               number))))
 
-(define-lap-function %%single-float-sqrt ()
-  ;; Unbox the float.
-  (sys.lap-x86:mov64 :rax :r8)
-  (sys.lap-x86:shr64 :rax 32)
-  ;; Load into XMM registers.
-  (sys.lap-x86:movd :xmm0 :eax)
-  ;; Sqrt.
-  (sys.lap-x86:sqrtss :xmm0 :xmm0)
-  ;; Box.
-  (sys.lap-x86:movd :eax :xmm0)
-  (sys.lap-x86:shl64 :rax 32)
-  (sys.lap-x86:lea64 :r8 (:rax #.+tag-single-float+))
-  (sys.lap-x86:mov32 :ecx #.(ash 1 +n-fixnum-bits+))
-  (sys.lap-x86:ret))
-
-(sys.int::define-lap-function %%double-float-sqrt ()
-  (sys.lap-x86:movq :xmm0 (:object :r8 0))
-  (sys.lap-x86:sqrtsd :xmm0 (:object :r9 0))
-  (sys.lap-x86:movq :rax :xmm0)
-  (sys.lap-x86:mov64 :r13 (:function sys.int::%%make-double-float-rax))
-  (sys.lap-x86:jmp (:object :r13 #.sys.int::+fref-entry-point+)))
-
 (defun sqrt (number)
   (check-type number number)
   (etypecase number
@@ -1144,88 +598,29 @@ Implements the dumb mp_div algorithm from BigNum Math."
     (real
      (%%single-float-sqrt (float number 0.0f0)))))
 
-;;; Convert a bignum to canonical form.
-;;; If it can be represented as a fixnum it is converted,
-;;; otherwise it is converted to the shortest possible bignum
-;;; by removing redundant sign-extension bits.
-(define-lap-function %%canonicalize-bignum ()
-  (sys.lap-x86:push :rbp)
-  (:gc :no-frame :layout #*0)
-  (sys.lap-x86:mov64 :rbp :rsp)
-  (:gc :frame)
-  (sys.lap-x86:mov64 :rax (:r8 #.(- +tag-object+)))
-  (sys.lap-x86:shr64 :rax #.+object-data-shift+) ; RAX = number of fragments (raw).
-  ;; Zero-size bignums are zero.
-  (sys.lap-x86:jz return-zero)
-  ;; Read the sign bit.
-  (sys.lap-x86:mov64 :rcx (:r8 #.(- +tag-object+) (:rax 8)))
-  (sys.lap-x86:sar64 :rcx 63) ; rcx = sign-extended sign-bit.
-  crunch-loop
-  (sys.lap-x86:cmp64 :rax 1)
-  (sys.lap-x86:je maybe-fixnumize)
-  ;; Read the last fragment.
-  (sys.lap-x86:mov64 :rsi (:r8 #.(- +tag-object+) (:rax 8)))
-  ;; Compare against the extended sign bit.
-  ;; Finish if they're not equal.
-  (sys.lap-x86:cmp64 :rsi :rcx)
-  (sys.lap-x86:jne maybe-resize-bignum)
-  ;; Read the sign bit of the second-to-last fragment
-  (sys.lap-x86:mov64 :rsi (:r8 #.(+ (- +tag-object+) -8) (:rax 8)))
-  (sys.lap-x86:sar64 :rsi 63)
-  ;; Compare against the original sign bit. If equal, then this
-  ;; fragment can be dropped.
-  (sys.lap-x86:cmp64 :rsi :rcx)
-  (sys.lap-x86:jne maybe-resize-bignum)
-  (sys.lap-x86:sub64 :rax 1)
-  (sys.lap-x86:jmp crunch-loop)
-  ;; Final size of the bignum has been determined.
-  maybe-resize-bignum
-  ;; Test if the size actually changed.
-  (sys.lap-x86:mov64 :rdx (:r8 #.(- +tag-object+)))
-  (sys.lap-x86:shr64 :rdx #.+object-data-shift+)
-  (sys.lap-x86:cmp64 :rax :rdx)
-  ;; If it didn't change, return the original bignum.
-  ;; TODO: eventually the bignum code will pass in stack-allocated
-  ;; bignum objects, this'll have to allocate anyway...
-  (sys.lap-x86:je do-return)
-  ;; Resizing.
-  ;; Save original bignum.
-  (sys.lap-x86:push :r8)
-  (:gc :frame :layout #*1)
-  ;; Save new size.
-  (sys.lap-x86:push :rax)
-  (:gc :frame :layout #*10)
-  ;; RAX = new size.
-  (sys.lap-x86:lea64 :r8 ((:rax #.(ash 1 +n-fixnum-bits+))))
-  (sys.lap-x86:mov64 :rcx #.(ash 1 +n-fixnum-bits+)) ; fixnum 1
-  (sys.lap-x86:mov64 :r13 (:function %make-bignum-of-length))
-  (sys.lap-x86:call (:r13 #.(+ (- sys.int::+tag-object+) 8 (* sys.int::+fref-entry-point+ 8))))
-  ;; Fetch the original bignum.
-  (sys.lap-x86:mov64 :rcx (:rsp))
-  (sys.lap-x86:mov64 :r9 (:rsp 8))
-  (:gc :frame)
-  ;; Copy words, we know there will always be at least one.
-  copy-loop
-  (sys.lap-x86:mov64 :rax (:r9 #.(- +tag-object+) (:rcx 8)))
-  (sys.lap-x86:mov64 (:r8 #.(- +tag-object+) (:rcx 8)) :rax)
-  (sys.lap-x86:sub64 :rcx 1)
-  (sys.lap-x86:jnz copy-loop)
-  do-return
-  (sys.lap-x86:mov32 :ecx #.(ash 1 +n-fixnum-bits+))
-  (sys.lap-x86:leave)
-  (:gc :no-frame)
-  (sys.lap-x86:ret)
-  ;; Attempt to convert a size-1 bignum to a fixnum.
-  maybe-fixnumize
-  (:gc :frame)
-  (sys.lap-x86:mov64 :rdx (:r8 #.(+ (- +tag-object+) 8)))
-  (sys.lap-x86:imul64 :rdx #.(ash 1 +n-fixnum-bits+))
-  (sys.lap-x86:jo maybe-resize-bignum)
-  (sys.lap-x86:mov64 :r8 :rdx)
-  (sys.lap-x86:jmp do-return)
-  return-zero
-  (sys.lap-x86:xor32 :r8d :r8d)
-  (sys.lap-x86:jmp do-return))
+(defun isqrt (number)
+  (values (floor (sqrt number))))
+
+(macrolet ((def (name bignum-name)
+             `(defun ,name (x y)
+                (cond ((and (fixnump x)
+                            (fixnump y))
+                       (error "FIXNUM/FIXNUM case hit ~S." ',name))
+                      ((and (fixnump x)
+                            (bignump y))
+                       (,bignum-name (%make-bignum-from-fixnum x) y))
+                      ((and (bignump x)
+                            (fixnump y))
+                       (,bignum-name x (%make-bignum-from-fixnum y)))
+                      ((and (bignump x)
+                            (bignump y))
+                       (,bignum-name x y))
+                      (t (check-type x integer)
+                         (check-type y integer)
+                         (error "Argument combination not supported."))))))
+  (def generic-logand %%bignum-logand)
+  (def generic-logior %%bignum-logior)
+  (def generic-logxor %%bignum-logxor))
 
 (defun generic-lognot (integer)
   (logxor integer -1))
@@ -1273,6 +668,8 @@ Implements the dumb mp_div algorithm from BigNum Math."
 
 (defun boole (op integer-1 integer-2)
   "Perform bit-wise logical OP on INTEGER-1 and INTEGER-2."
+  (check-type integer-1 integer)
+  (check-type integer-2 integer)
   (ecase op
     (boole-1 integer-1)
     (boole-2 integer-2)
@@ -1307,6 +704,16 @@ Implements the dumb mp_div algorithm from BigNum Math."
 (defconstant +sleef-pi4-cf+ 3.7747668102383613586f-08)
 (defconstant +sleef-pi4-df+ 1.2816720341285448015f-12)
 
+(defun sleef-mulsignf (x y)
+  (sys.int::%integer-as-single-float
+   (logxor
+    (sys.int::%single-float-as-integer x)
+    (logand (sys.int::%single-float-as-integer y)
+            (ash 1 31)))))
+
+(defun sleef-signf (d)
+  (sleef-mulsignf 1.0f0 d))
+
 (defun sleef-mlaf (x y z)
   (+ (* x y) z))
 
@@ -1332,7 +739,7 @@ Implements the dumb mp_div algorithm from BigNum Math."
   (let ((q 0)
         (u 0.0f0)
         (s 0.0f0))
-    (setf q (sleef-rintf (* d (/ (float pi)))))
+    (setf q (sleef-rintf (* d (/ (float pi 0.0f0)))))
 
     (setf d (sleef-mlaf q (* +sleef-pi4-af+ -4) d))
     (setf d (sleef-mlaf q (* +sleef-pi4-bf+ -4) d))
@@ -1401,10 +808,10 @@ Implements the dumb mp_div algorithm from BigNum Math."
         (s 0.0d0))
     (setf q (+ 1 (* 2 (sleef-rint (- (* d (/ (float pi 0.0d0))) 0.5d0)))))
 
-    (setf d (sleef-mla q (* +sleef-pi4-a+ -4) d))
-    (setf d (sleef-mla q (* +sleef-pi4-b+ -4) d))
-    (setf d (sleef-mla q (* +sleef-pi4-c+ -4) d))
-    (setf d (sleef-mla q (* +sleef-pi4-d+ -4) d))
+    (setf d (sleef-mla q (* +sleef-pi4-a+ -2) d))
+    (setf d (sleef-mla q (* +sleef-pi4-b+ -2) d))
+    (setf d (sleef-mla q (* +sleef-pi4-c+ -2) d))
+    (setf d (sleef-mla q (* +sleef-pi4-d+ -2) d))
 
     (setf s (* d d))
 
@@ -1429,69 +836,178 @@ Implements the dumb mp_div algorithm from BigNum Math."
 (defun sin (x)
   (etypecase x
     (complex
-     (let ((real (realpart number))
-           (imag (imagpart number)))
+     (let ((real (realpart x))
+           (imag (imagpart x)))
        (complex (* (sin real) (cosh imag))
                 (* (cos real) (sinh imag)))))
     (double-float
      (sin-double-float x))
     (real
-     (sin-single-float (float x)))))
+     (sin-single-float (float x 0.0f0)))))
 
 (defun cos (x)
   (etypecase x
     (complex
-     (let ((real (realpart number))
-           (imag (imagpart number)))
+     (let ((real (realpart x))
+           (imag (imagpart x)))
        (complex (* (cos real) (cosh imag))
                 (- (* (sin real) (sinh imag))))))
     (double-float
      (cos-double-float x))
     (real
-     (cos-single-float (float x)))))
+     (cos-single-float (float x 0.0f0)))))
 
-;;; http://en.literateprograms.org/Logarithm_Function_(Python)
-(defun log-e (x)
-  (let ((base 2.71828)
-        (epsilon 0.000000000001)
-        (integer 0)
-        (partial 0.5)
-        (decimal 0.0))
-    (loop (when (>= x 1) (return))
-       (decf integer)
-       (setf x (* x base)))
-    (loop (when (< x base) (return))
-       (incf integer)
-       (setf x (/ x base)))
-    (setf x (* x x))
-    (loop (when (<= partial epsilon) (return))
-       (when (>= x base) ;If X >= base then a_k is 1
-         (incf decimal partial) ;Insert partial to the front of the list
-         (setf x (/ x base))) ;Since a_k is 1, we divide the number by the base
-       (setf partial (* partial 0.5))
-       (setf x (* x x)))
-    (+ integer decimal)))
+(defun tan (d)
+  (let (q u s x)
+    (setf q (sleef-rintf (* d 2 (/ (float pi 0.0f0)))))
+
+    (setf x d)
+
+    (setf x (sleef-mlaf q (* +sleef-pi4-af+ -4 0.5f0) x))
+    (setf x (sleef-mlaf q (* +sleef-pi4-bf+ -4 0.5f0) x))
+    (setf x (sleef-mlaf q (* +sleef-pi4-cf+ -4 0.5f0) x))
+    (setf x (sleef-mlaf q (* +sleef-pi4-df+ -4 0.5f0) x))
+
+    (setf s (* x x))
+
+    (when (not (eql (logand q 1) 0))
+      (setf x (- x)))
+
+    (setf u 0.00927245803177356719970703f0)
+    (setf u (sleef-mlaf u s 0.00331984995864331722259521f0))
+    (setf u (sleef-mlaf u s 0.0242998078465461730957031f0))
+    (setf u (sleef-mlaf u s 0.0534495301544666290283203f0))
+    (setf u (sleef-mlaf u s 0.133383005857467651367188f0))
+    (setf u (sleef-mlaf u s 0.333331853151321411132812f0))
+
+    (setf u (sleef-mlaf s (* u x) x))
+
+    (when (not (eql (logand q 1) 0))
+      (setf u (/ u)))
+
+    (when (float-infinity-p d)
+      (setf u (/ 0.0f0 0.0f0)))
+
+    u))
+
+(defconstant +sleef-r-ln2f+ 1.442695040888963407359924681001892137426645954152985934135449406931f0)
+(defconstant +sleef-l2uf+ 0.693145751953125f0)
+(defconstant +sleef-l2lf+ 1.428606765330187045f-06)
+
+(defun sleef-ldexpkf (x q)
+  (let (u m)
+    (setf m (ash q -31))
+    (setf m (ash (- (ash (+ m q) -6) m) 4))
+    (setf q (- q (ash m 2)))
+    (incf m 127)
+    (setf m (if (< m 0) 0 m))
+    (setf m (if (> m 255) 255 m))
+    (setf u (sys.int::%integer-as-single-float (ash m 23)))
+    (setf x (* x u u u u))
+    (setf u (sys.int::%integer-as-single-float (ash (+ q #x7f) 23)))
+    (* x u)))
+
+(defun sleef-ilogbkf (d)
+  (let (m q)
+    (setf m (< d 5.421010862427522f-20))
+    (setf d (if m
+                (* 1.8446744073709552f19 d)
+                d))
+    (setf q (logand (ash (sys.int::%single-float-as-integer d) -23) #xFF))
+    (if m
+        (- q (+ 64 #x7F))
+        (- q #x7F))))
+
+(defun exp (number)
+  (let ((d (float number 0.0f0))
+        q s u)
+    (setf q (sleef-rintf (* d +sleef-r-ln2f+)))
+    (setf s (sleef-mlaf q (- +sleef-l2uf+) d))
+    (setf s (sleef-mlaf q (- +sleef-l2lf+) s))
+
+    (setf u 0.000198527617612853646278381f0)
+    (setf u (sleef-mlaf u s 0.00139304355252534151077271f0))
+    (setf u (sleef-mlaf u s 0.00833336077630519866943359f0))
+    (setf u (sleef-mlaf u s 0.0416664853692054748535156f0))
+    (setf u (sleef-mlaf u s 0.166666671633720397949219f0))
+    (setf u (sleef-mlaf u s 0.5f0))
+
+    (setf u (+ (* s s u) s 1.0f0))
+    (setf u (sleef-ldexpkf u q))
+
+    (if (< d -104) (setf u 0))
+    (if (> d  104) (setf u single-float-positive-infinity))
+
+    (if (floatp number)
+        (float u number)
+        u)))
+
+(defun log-e (number)
+  (let ((d (float number 0.0f0))
+        x x2 tt m e)
+    (setf e (sleef-ilogbkf (* d (/ 0.75f0))))
+    (setf m (sleef-ldexpkf d (- e)))
+
+    (setf x (/ (- m 1.0f0) (+ m 1.0f0)))
+    (setf x2 (* x x))
+
+    (setf tt 0.2392828464508056640625f0)
+    (setf tt (sleef-mlaf tt x2 0.28518211841583251953125f0))
+    (setf tt (sleef-mlaf tt x2 0.400005877017974853515625f0))
+    (setf tt (sleef-mlaf tt x2 0.666666686534881591796875f0))
+    (setf tt (sleef-mlaf tt x2 2.0f0))
+
+    (setf x (+ (* x tt) (* 0.693147180559945286226764f0 e)))
+
+    (when (float-infinity-p d)
+      (setf x single-float-positive-infinity))
+    (when (< d 0)
+      (setf x (/ 0.0f0 0.0f0)))
+    (when (= d 0)
+      (setf x single-float-negative-infinity))
+
+    (if (floatp number)
+        (float x number)
+        x)))
 
 (defun log (number &optional base)
   (if base
       (/ (log number) (log base))
       (log-e number)))
 
-;;; http://forums.devshed.com/c-programming-42/implementing-an-atan-function-200106.html
 (defun atan (number1 &optional number2)
   (if number2
       (atan2 number1 number2)
-      (let ((x number1)
-            (y 0.0))
-        (when (zerop number1)
-          (return-from atan 0))
-        (when (< x 0)
-          (return-from atan (- (atan (- x)))))
-        (setf x (/ (- x 1.0) (+ x 1.0))
-              y (* x x))
-        (setf x (* (+ (* (- (* (+ (* (- (* (+ (* (- (* (+ (* (- (* 0.0028662257 y) 0.0161657367) y) 0.0429096138) y) 0.0752896400) y) 0.1065626393) y) 0.1420889944) y) 0.1999355085) y) 0.3333314528) y) 1) x))
-        (setf x (+ 0.785398163397 x))
-        x)))
+      (let ((s (float number1 0.0f0))
+            (q 0)
+            tt u)
+        (when (= (sleef-signf s) -1)
+          (setf s (- s))
+          (setf q 2))
+        (when (> s 1)
+          (setf s (/ s))
+          (setf q (logior q 1)))
+
+        (setf tt (* s s))
+
+        (setf u 0.00282363896258175373077393f0)
+        (setf u (sleef-mlaf u tt -0.0159569028764963150024414f0))
+        (setf u (sleef-mlaf u tt 0.0425049886107444763183594f0))
+        (setf u (sleef-mlaf u tt -0.0748900920152664184570312f0))
+        (setf u (sleef-mlaf u tt 0.106347933411598205566406f0))
+        (setf u (sleef-mlaf u tt -0.142027363181114196777344f0))
+        (setf u (sleef-mlaf u tt 0.199926957488059997558594f0))
+        (setf u (sleef-mlaf u tt -0.333331018686294555664062f0))
+
+        (setf tt (+ s (* s tt u)))
+
+        (when (not (eql (logand q 1) 0))
+          (setf tt (- 1.570796326794896557998982f0 tt)))
+        (when (not (eql (logand q 2) 0))
+          (setf tt (- tt)))
+        (if (floatp number1)
+            (float tt number1)
+            tt))))
 
 (defun atan2 (y x)
   (cond ((> x 0) (atan (/ y x)))
@@ -1682,3 +1198,154 @@ Implements the dumb mp_div algorithm from BigNum Math."
          (float -1 float1)
          (float 1 float1))
      (abs float2)))
+
+(defun float-digits (f)
+  (check-type f float)
+  (etypecase f
+    (single-float +single-float-digits+)
+    (double-float +double-float-digits+)))
+
+(defun float-radix (x)
+  "Return (as an integer) the radix b of its floating-point argument."
+  (check-type x float)
+  2)
+
+(defun float-denormalized-p (x)
+  "Return true if the float X is denormalized."
+  (check-type x float)
+  (etypecase x
+    (single-float
+     (and (zerop (ldb +single-float-exponent-byte+ (%single-float-as-integer x)))
+          (not (zerop x))))
+    ((double-float)
+     (and (zerop (ldb +double-float-exponent-byte+
+                      (ash (%double-float-as-integer x) -32)))
+          (not (zerop x))))))
+
+(defun float-precision (f)
+  "Return a non-negative number of significant digits in its float argument.
+  Will be less than FLOAT-DIGITS if denormalized or zero."
+  (check-type f float)
+  (macrolet ((frob (digits bias decode)
+               `(cond ((zerop f) 0)
+                      ((float-denormalized-p f)
+                       (multiple-value-bind (ignore exp) (,decode f)
+                         (declare (ignore ignore))
+                         (the fixnum
+                                    (+ ,digits (1- ,digits) ,bias exp))))
+                      (t
+                       ,digits))))
+    (etypecase f
+      (single-float
+       (frob +single-float-digits+ +single-float-bias+
+         integer-decode-single-denorm))
+      (double-float
+       (frob +double-float-digits+ +double-float-bias+
+         integer-decode-double-denorm)))))
+
+(defun scale-float (float integer)
+  (* float (expt (float (float-radix float) float) integer)))
+
+;;; Handle the denormalized case of DECODE-SINGLE-FLOAT. We call
+;;; INTEGER-DECODE-SINGLE-DENORM and then make the result into a float.
+(defun decode-single-denorm (x)
+  (check-type x single-float)
+  (multiple-value-bind (sig exp sign)
+      (integer-decode-single-denorm x)
+    (values (%integer-as-single-float
+             (dpb sig +single-float-significand-byte+
+                  (dpb +single-float-bias+
+                       +single-float-exponent-byte+
+                       0)))
+            (+ exp +single-float-digits+)
+            (float sign x))))
+
+;;; Handle the single-float case of DECODE-FLOAT. If an infinity or NaN,
+;;; error. If a denorm, call d-s-DENORM to handle it.
+(defun decode-single-float (x)
+  (check-type x single-float)
+  (let* ((bits (%single-float-as-integer (abs x)))
+         (exp (ldb +single-float-exponent-byte+ bits))
+         (sign (float-sign x))
+         (biased (- exp +single-float-bias+)))
+    (unless (<= exp +single-float-normal-exponent-max+)
+      (error "can't decode NaN or infinity: ~S" x))
+    (cond ((zerop x)
+           (values 0.0f0 biased sign))
+          ((< exp +single-float-normal-exponent-min+)
+           (decode-single-denorm x))
+          (t
+           (values (%integer-as-single-float
+                    (dpb +single-float-bias+
+                         +single-float-exponent-byte+
+                         bits))
+                   biased sign)))))
+
+;;; like DECODE-SINGLE-DENORM, only doubly so
+(defun decode-double-denorm (x)
+  (check-type x double-float)
+  (multiple-value-bind (sig exp sign)
+      (integer-decode-double-denorm x)
+    (values (%integer-as-double-float
+             (logior
+              (ash (dpb (logand (ash sig -32)
+                                (lognot +double-float-hidden-bit+))
+                        +double-float-significand-byte+
+                        (dpb +double-float-bias+
+                             +double-float-exponent-byte+
+                             0))
+                   32)
+              (ldb (byte 32 0) sig)))
+            (+ exp +double-float-digits+)
+            (float sign x))))
+
+;;; like DECODE-SINGLE-FLOAT, only doubly so
+(defun decode-double-float (x)
+  (check-type x double-float)
+  (let* ((abs (abs x))
+         (hi (ldb (byte 32 32) (%double-float-as-integer abs)))
+         (lo (ldb (byte 32 0) (%double-float-as-integer abs)))
+         (exp (ldb +double-float-exponent-byte+ hi))
+         (sign (float-sign x))
+         (biased (- exp +double-float-bias+)))
+    (unless (<= exp +double-float-normal-exponent-max+)
+      (error "can't decode NaN or infinity: ~S" x))
+    (cond ((zerop x)
+           (values 0.0d0 biased sign))
+          ((< exp +double-float-normal-exponent-min+)
+           (decode-double-denorm x))
+          (t
+           (values (%integer-as-double-float
+                    (logior
+                     (ash (dpb +double-float-bias+
+                               +double-float-exponent-byte+ hi)
+                          32)
+                     lo))
+                   biased sign)))))
+
+;;; Dispatch to the appropriate type-specific function.
+(defun decode-float (f)
+  "Return three values:
+   1) a floating-point number representing the significand. This is always
+      between 0.5 (inclusive) and 1.0 (exclusive).
+   2) an integer representing the exponent.
+   3) -1.0 or 1.0 (i.e. the sign of the argument.)"
+  (check-type f float)
+  (etypecase f
+    (single-float
+     (decode-single-float f))
+    (double-float
+     (decode-double-float f))))
+
+(defun rational (number)
+  (check-type number real)
+  (etypecase number
+    (rational
+     number)
+    (float
+     (multiple-value-bind (significand exponent sign)
+         (integer-decode-float number)
+       (* significand (expt (float-radix number) exponent) sign)))))
+
+(defun rationalize (number)
+  (rational number))

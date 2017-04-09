@@ -14,7 +14,7 @@
 ;;; Primordial class objects installed in the class table during boot will
 ;;; be converted in-place to real classes after boot.
 
-(defvar *class-table* (make-hash-table :test #'eq))
+(sys.int::defglobal *class-table* (make-hash-table :test #'eq))
 
 (defun find-class (symbol &optional (errorp t) environment)
   (let ((class (gethash symbol *class-table* nil)))
@@ -29,21 +29,17 @@
 (defun (setf find-class) (new-value symbol &optional (errorp t) environment)
   (setf (gethash symbol *class-table*) new-value))
 
-(defvar *next-class-hash-value* 1)
+(sys.int::defglobal *next-class-hash-value* 1)
 
 (defun next-class-hash-value ()
-  (let ((cell (mezzano.runtime::symbol-global-value-cell
-               '*next-class-hash-value*)))
-    (sys.int::%atomic-fixnum-add-object cell
-                                        sys.int::+symbol-value-cell-value+
-                                        1)))
+  (sys.int::%atomic-fixnum-add-symbol '*next-class-hash-value* 1))
 
-(defparameter *secret-unbound-value* (list "slot unbound"))
+(sys.int::defglobal *secret-unbound-value* (list "slot unbound"))
 
 ;;; Primordial classes. These map from class names (not class objects!)
 ;;; to the argument list passed to ensure-class (plus a :name argument).
 
-(defvar *primordial-class-table* (make-hash-table))
+(sys.int::defglobal *primordial-class-table* (make-hash-table))
 
 (defun ensure-class (name
                      &rest all-keys
@@ -459,6 +455,7 @@
 (defun finalize-primordial-class (class)
   (when (not (primordial-slot-value class 'finalized-p))
     (dolist (super (primordial-slot-value class 'direct-superclasses))
+      (push class (primordial-slot-value super 'direct-subclasses))
       (finalize-primordial-class super))
     ;;(format t "Finalizing class ~S.~%" (primordial-slot-value class 'name))
     (setf (primordial-slot-value class 'class-precedence-list)

@@ -18,6 +18,7 @@
 (sys.int::defglobal *pager-disk-request*)
 
 (sys.int::defglobal *paging-disk*)
+(sys.int::defglobal *paging-read-only*)
 (sys.int::defglobal *bml4*)
 
 (sys.int::defglobal *page-replacement-list-head*)
@@ -27,44 +28,16 @@
 
 (sys.int::defglobal *store-fudge-factor*)
 
-(defconstant +page-table-present+        #x001)
-(defconstant +page-table-write+          #x002)
-(defconstant +page-table-user+           #x004)
-(defconstant +page-table-write-through+  #x008)
-(defconstant +page-table-cache-disabled+ #x010)
-(defconstant +page-table-accessed+       #x020)
-(defconstant +page-table-dirty+          #x040)
-(defconstant +page-table-page-size+      #x080)
-(defconstant +page-table-global+         #x100)
-(defconstant +page-table-copy-on-write+  #x400)
-(defconstant +page-table-address-mask+   #x000FFFFFFFFFF000)
-
 (defun pager-log (&rest things)
   (declare (dynamic-extent things))
   (when *pager-noisy*
     (debug-print-line-1 things)))
 
-(declaim (inline flush-tlb))
-(defun flush-tlb ()
-  ;; Reloading CR3 on x86oids causes all TLBs to be marked invalid.
-  (setf (sys.int::%cr3) (sys.int::%cr3)))
-
 (declaim (inline page-table-entry (setf page-table-entry)))
-(defun page-table-entry (page-table index)
+(defun page-table-entry (page-table &optional (index 0))
   (sys.int::memref-unsigned-byte-64 page-table index))
-(defun (setf page-table-entry) (value page-table index)
+(defun (setf page-table-entry) (value page-table &optional (index 0))
   (setf (sys.int::memref-unsigned-byte-64 page-table index) value))
-
-(declaim (inline page-present-p))
-(defun page-present-p (page-table index)
-  (logtest +page-table-present+
-           (page-table-entry page-table index)))
-
-(declaim (inline address-l4-bits address-l3-bits address-l2-bits address-l1-bits))
-(defun address-l4-bits (address) (ldb (byte 9 39) address))
-(defun address-l3-bits (address) (ldb (byte 9 30) address))
-(defun address-l2-bits (address) (ldb (byte 9 21) address))
-(defun address-l1-bits (address) (ldb (byte 9 12) address))
 
 (declaim (inline zeroize-page zeroize-physical-page))
 (defun zeroize-page (addr)
@@ -135,48 +108,65 @@ the data. Free the page with FREE-PAGE when done."
       (panic "Unable to read page from disk"))
     page))
 
-(defun initialize-block-map (bml4-block)
-  (debug-print-line "Reading block map.")
-  (labels ((one-level (block-id fn)
-             ;; Process a non-leaf level of the block map.
-             ;; FN is called on each present block id to produce the next level.
-             ;; Generate a table of memory pointers to the next level.
-             (let ((memory-repr (allocate-page "Block Map")))
-               (zeroize-page memory-repr)
-               (with-disk-block (disk-repr block-id)
-                 (dotimes (i 512)
-                   (let ((entry (sys.int::memref-unsigned-byte-64 disk-repr i)))
-                     (when (block-info-present-p entry)
-                       (setf (sys.int::memref-signed-byte-64 memory-repr i)
-                             (funcall fn (block-info-block-id entry)))))))
-               memory-repr))
-           (level-1 (block-id)
-             (read-disk-block block-id))
-           (level-2 (block-id)
-             (one-level block-id #'level-1))
-           (level-3 (block-id)
-             (one-level block-id #'level-2))
-           (level-4 (block-id)
-             (one-level block-id #'level-3)))
-    (setf *bml4* (level-4 bml4-block))
-    (debug-print-line "BML4 at " *bml4*)))
-
 (defconstant +image-header-block-map+ 96)
 (defconstant +image-header-freelist+ 104)
 
-(defun initialize-paging-system (disk header)
+(defun initialize-paging-system ()
+  (cond ((boot-option +boot-option-freestanding+)
+         (initialize-freestanding-paging-system))
+        (t
+         (detect-paging-disk)
+         (when (not *paging-disk*)
+           (panic "Could not find boot device. Sorry.")))))
+
+(defun initialize-freestanding-paging-system ()
+  (setf *paging-disk* :freestanding
+        *paging-read-only* t)
+  (debug-print-line "Running freestanding.")
+  (setf *bml4* (sys.int::memref-signed-byte-64 (+ *boot-information-page* +boot-information-block-map+)))
+  (debug-print-line "BML4 at " *bml4*)
+  (initialize-freestanding-store)
+  (setf *store-fudge-factor* (- (truncate (physical-memory-statistics) 1.1)))
+  (debug-print-line "Set fudge factor to " *store-fudge-factor*)
+  (debug-print-line "Waking pager thread.")
+  (setf (thread-state sys.int::*pager-thread*) :runnable)
+  (push-run-queue sys.int::*pager-thread*))
+
+(defun initialize-hosted-paging-system (disk header)
   (setf *paging-disk* disk)
-  (initialize-block-map (sys.int::memref-unsigned-byte-64 (+ header +image-header-block-map+) 0))
+  (setf *paging-read-only* (or (not (disk-writable-p disk))
+                               (boot-option +boot-option-force-read-only+)))
+  (when *paging-read-only*
+    (debug-print-line "Running read-only."))
+  (setf *bml4* (sys.int::memref-signed-byte-64 (+ *boot-information-page* +boot-information-block-map+)))
+  (debug-print-line "BML4 at " *bml4*)
   (initialize-store-freelist (truncate (* (disk-n-sectors *paging-disk*) (disk-sector-size *paging-disk*)) #x1000)
-                             (sys.int::memref-unsigned-byte-64 (+ header +image-header-freelist+) 0))
+                             (sys.int::memref-unsigned-byte-64 (+ header +image-header-freelist+)))
   (multiple-value-bind (free-blocks total-blocks)
       (store-statistics)
-    (setf *store-fudge-factor* (+ (- total-blocks free-blocks) 256))
-    (debug-print-line "Set fudge factor to " *store-fudge-factor*))
+    ;; This is a rough approximation of the total image size.
+    (let ((allocated-blocks (- total-blocks free-blocks)))
+      ;; When running read-only, we can only use main memory (minus the total used by the image).
+      (cond (*paging-read-only*
+             (setf *store-fudge-factor* (- (+ (truncate (physical-memory-statistics) 1.1)
+                                              allocated-blocks))))
+            (t
+             (setf *store-fudge-factor* (+ allocated-blocks 256))))))
+  (debug-print-line "Set fudge factor to " *store-fudge-factor*)
   (debug-print-line "Waking pager thread.")
-  (setf (thread-state sys.int::*pager-thread*) :runnable))
+  (setf (thread-state sys.int::*pager-thread*) :runnable)
+  (push-run-queue sys.int::*pager-thread*))
 
 (defun detect-paging-disk ()
+  (debug-print-line "Looking for paging disk with UUID "
+                    (boot-uuid 0) ":" (boot-uuid 1) ":"
+                    (boot-uuid 2) ":" (boot-uuid 3) ":"
+                    (boot-uuid 4) ":" (boot-uuid 5) ":"
+                    (boot-uuid 6) ":" (boot-uuid 7) ":"
+                    (boot-uuid 8) ":" (boot-uuid 9) ":"
+                    (boot-uuid 10) ":" (boot-uuid 11) ":"
+                    (boot-uuid 12) ":" (boot-uuid 13) ":"
+                    (boot-uuid 14) ":" (boot-uuid 15))
   (dolist (disk (all-disks))
     (let* ((sector-size (disk-sector-size disk))
            (page (allocate-physical-pages (ceiling (max +4k-page-size+ sector-size) +4k-page-size+)
@@ -187,48 +177,46 @@ the data. Free the page with FREE-PAGE when done."
         (panic "Unable to read first block on disk " disk))
       ;; Search for a Mezzano header here.
       (unwind-protect
-           (when (and
-                  (not *paging-disk*)
-                  ;; Match magic.
-                  (loop
-                     for byte in '(#x00 #x4D #x65 #x7A #x7A #x61 #x6E #x69 #x6E #x65 #x49 #x6D #x61 #x67 #x65 #x00)
-                     for offset from 0
-                     do (when (not (eql (sys.int::memref-unsigned-byte-8 page-addr offset) byte))
-                          (return nil))
-                     finally (return t))
-                  ;; Match boot UUID.
-                  (loop
-                     for offset from 0 below 16
-                     do (when (not (eql (sys.int::memref-unsigned-byte-8 page-addr (+ 16 offset))
-                                        (boot-uuid offset)))
-                          (return nil))
-                     finally (return t)))
-             (debug-print-line "Found boot image on disk " disk "!")
-             (initialize-paging-system disk page-addr)
-             (return))
+           (flet ((check-magic ()
+                    (loop
+                       for byte in '(#x00 #x4D #x65 #x7A #x7A #x61 #x6E #x69 #x6E #x65 #x49 #x6D #x61 #x67 #x65 #x00)
+                       for offset from 0
+                       do (when (not (eql (sys.int::memref-unsigned-byte-8 page-addr offset) byte))
+                            (return nil))
+                       finally (return t)))
+                  (check-uuid ()
+                    (loop
+                       for offset from 0 below 16
+                       do (when (not (eql (sys.int::memref-unsigned-byte-8 page-addr (+ 16 offset))
+                                          (boot-uuid offset)))
+                            (return nil))
+                       finally (return t))))
+             (declare (dynamic-extent #'check-magic #'check-uuid))
+             (when (check-magic)
+               (debug-print-line "Found image with UUID "
+                                 (sys.int::memref-unsigned-byte-8 page-addr (+ 16 0)) ":"
+                                 (sys.int::memref-unsigned-byte-8 page-addr (+ 16 1)) ":"
+                                 (sys.int::memref-unsigned-byte-8 page-addr (+ 16 2)) ":"
+                                 (sys.int::memref-unsigned-byte-8 page-addr (+ 16 3)) ":"
+                                 (sys.int::memref-unsigned-byte-8 page-addr (+ 16 4)) ":"
+                                 (sys.int::memref-unsigned-byte-8 page-addr (+ 16 5)) ":"
+                                 (sys.int::memref-unsigned-byte-8 page-addr (+ 16 6)) ":"
+                                 (sys.int::memref-unsigned-byte-8 page-addr (+ 16 7)) ":"
+                                 (sys.int::memref-unsigned-byte-8 page-addr (+ 16 8)) ":"
+                                 (sys.int::memref-unsigned-byte-8 page-addr (+ 16 9)) ":"
+                                 (sys.int::memref-unsigned-byte-8 page-addr (+ 16 10)) ":"
+                                 (sys.int::memref-unsigned-byte-8 page-addr (+ 16 11)) ":"
+                                 (sys.int::memref-unsigned-byte-8 page-addr (+ 16 12)) ":"
+                                 (sys.int::memref-unsigned-byte-8 page-addr (+ 16 13)) ":"
+                                 (sys.int::memref-unsigned-byte-8 page-addr (+ 16 14)) ":"
+                                 (sys.int::memref-unsigned-byte-8 page-addr (+ 16 15))
+                                 " on disk " disk)
+               (when (check-uuid)
+                 (debug-print-line "Found boot image on disk " disk "!")
+                 (initialize-hosted-paging-system disk page-addr)
+                 (return))))
         ;; Release the pages.
         (release-physical-pages page (ceiling (max +4k-page-size+ sector-size) +4k-page-size+))))))
-
-(defun descend-page-table (page-table index allocate)
-  (if (not (page-present-p page-table index))
-      (when allocate
-        ;; No PT. Allocate one.
-        (let* ((frame (pager-allocate-page :page-table))
-               (addr (convert-to-pmap-address (ash frame 12))))
-          (zeroize-page addr)
-          (setf (page-table-entry page-table index) (logior (ash frame 12)
-                                                            +page-table-present+
-                                                            +page-table-write+))
-          addr))
-      (convert-to-pmap-address (logand (page-table-entry page-table index)
-                                       +page-table-address-mask+))))
-
-(defun get-pte-for-address (address &optional (allocate t))
-  (let* ((cr3 (convert-to-pmap-address (logand (sys.int::%cr3) (lognot #xFFF))))
-         (pdp            (descend-page-table cr3  (address-l4-bits address) allocate))
-         (pdir (and pdp  (descend-page-table pdp  (address-l3-bits address) allocate)))
-         (pt   (and pdir (descend-page-table pdir (address-l2-bits address) allocate))))
-    (and pt (+ pt (* 8 (address-l1-bits address))))))
 
 (defun block-info-for-virtual-address-1 (address &optional allocate)
   "Return the address (access with (memref-ub64 X 0)) of the block map entry for ADDRESS.
@@ -257,22 +245,22 @@ Returns NIL if the entry is missing and ALLOCATE is false."
 (defun block-info-for-virtual-address (address)
   (let ((bme (block-info-for-virtual-address-1 address)))
     (cond ((or (null bme)
-               (zerop (block-info-block-id (sys.int::memref-unsigned-byte-64 bme 0))))
+               (zerop (block-info-block-id (sys.int::memref-unsigned-byte-64 bme))))
            nil)
-          (t (sys.int::memref-unsigned-byte-64 bme 0)))))
+          (t (sys.int::memref-unsigned-byte-64 bme)))))
 
 (defun allocate-new-block-for-virtual-address (address flags)
   (let ((new-block (if *pager-lazy-block-allocation-enabled*
                        sys.int::+block-map-id-lazy+
                        (or (store-alloc 1)
-                           (panic "Unabled to allocate new block!"))))
+                           (panic "Unable to allocate new block!"))))
         (bme (block-info-for-virtual-address-1 address t)))
     (when *pager-lazy-block-allocation-enabled*
       (incf *store-fudge-factor*))
     ;; Update the block info for this address.
-    (when (not (zerop (sys.int::memref-unsigned-byte-64 bme 0)))
+    (when (not (zerop (sys.int::memref-unsigned-byte-64 bme)))
       (panic "Block " address " entry not zero!"))
-    (setf (sys.int::memref-unsigned-byte-64 bme 0)
+    (setf (sys.int::memref-unsigned-byte-64 bme)
           (logior (ash new-block sys.int::+block-map-id-shift+)
                   sys.int::+block-map-committed+
                   flags))))
@@ -372,13 +360,10 @@ Returns NIL if the entry is missing and ALLOCATE is false."
       (set-address-flags address (logand block-info
                                          sys.int::+block-map-flag-mask+
                                          (lognot sys.int::+block-map-zero-fill+)))
-      (setf (page-table-entry pte 0) (logior (ash frame 12)
-                                             +page-table-present+
-                                             (if (block-info-writable-p block-info)
-                                                 +page-table-write+
-                                                 0)))
+      (setf (page-table-entry pte 0) (make-pte frame
+                                               :writable (block-info-writable-p block-info)))
       ;; Don't need to dirty the page like in W-F-P, the snapshotter takes all wired pages.
-      (sys.int::%invlpg address))))
+      (flush-tlb-single address))))
 
 (defun allocate-memory-range-in-pager (base length flags)
   (pager-log "Allocate range " base "-" (+ base length) "  " flags)
@@ -386,6 +371,10 @@ Returns NIL if the entry is missing and ALLOCATE is false."
     ;; This will require allocating new wired backing frames as well.
     (debug-print-line "TODO: Allocate pages in the wired area.")
     (return-from allocate-memory-range-in-pager nil))
+  (when (logtest flags sys.int::+block-map-wired+)
+    (ensure (or (< base #x80000000) ; wired area
+                (and (<= #x200000000000 base) ; wired stack area.
+                     (< base #x208000000000)))))
   (with-mutex (*vm-lock*)
     ;; Ensure there's enough fudged memory before allocating.
     (when (< (- *store-freelist-n-free-blocks* (truncate length +4k-page-size+)) *store-fudge-factor*)
@@ -397,7 +386,8 @@ Returns NIL if the entry is missing and ALLOCATE is false."
        (+ base (* i #x1000))
        flags))
     (when (and (<= #x200000000000 base) ; wired stack area.
-                   (< base #x208000000000))
+               (< base #x208000000000))
+      (ensure (logtest flags sys.int::+block-map-wired+))
       ;; Pages in the wired stack area don't require backing frames.
       (dotimes (i (truncate length #x1000))
         (map-new-wired-page (+ base (* i #x1000))))))
@@ -420,7 +410,7 @@ Returns NIL if the entry is missing and ALLOCATE is false."
       ;; Update page tables and release pages if possible.
       (let ((pte (get-pte-for-address (+ base (* i #x1000)) nil)))
         (when (and pte (page-present-p pte 0))
-          (release-vm-page (ash (page-table-entry pte 0) -12))
+          (release-vm-page (ash (pte-physical-address (page-table-entry pte 0)) -12))
           (setf (page-table-entry pte 0) 0))))
     (flush-tlb)))
 
@@ -450,7 +440,7 @@ Returns NIL if the entry is missing and ALLOCATE is false."
                      (block-info-zero-fill-p flags))
                  ;; Page going away, but it's ok. It'll be back, zero-filled.
                  #+(or)(debug-print-line "  flush page " (+ base (* i #x1000)) "  " (page-table-entry pte 0))
-                 (release-vm-page (ash (page-table-entry pte 0) -12))
+                 (release-vm-page (ash (pte-physical-address (page-table-entry pte 0)) -12))
                  (setf (page-table-entry pte 0) 0))
                 ((block-info-writable-p flags)
                  ;; Mark writable.
@@ -467,27 +457,29 @@ Returns NIL if the entry is missing and ALLOCATE is false."
     (when (not frame)
       ;; TODO: Purge empty page table levels.
       #+(or)(debug-print-line "Pager out of memory, preparing to SWAP!")
+      (when *paging-read-only*
+        (panic "Out of memory when running read-only."))
       (when (not *page-replacement-list-head*)
         (panic "No pages available for page-out?"))
       (let* ((candidate *page-replacement-list-head*)
              (candidate-virtual (physical-page-virtual-address candidate))
              (pte-addr (get-pte-for-address candidate-virtual nil))
-             (pte (sys.int::memref-unsigned-byte-64 pte-addr 0))
+             (dirty-p (page-dirty-p pte-addr))
              (bme-addr (block-info-for-virtual-address-1 candidate-virtual nil))
              (bme (sys.int::memref-unsigned-byte-64 bme-addr 0)))
         (ensure (eql (physical-page-frame-type candidate) :active)
                 "Page-out candidate has type " (physical-page-frame-type candidate) ", wanted :ACTIVE.")
         #+(or)(debug-print-line "Candidate " candidate ":" candidate-virtual
-                          "  pte " pte
+                          "  dirty-p " dirty-p
                           "  type " (physical-page-frame-type candidate)
                           "  block " (physical-page-frame-block-id candidate)
                           "  bme " bme)
         ;; Remove this page from the VM, but do not free it just yet.
         (remove-from-page-replacement-list candidate)
-        (setf (sys.int::memref-unsigned-byte-64 pte-addr 0) 0)
-        (sys.int::%invlpg candidate-virtual)
+        (setf (page-table-entry pte-addr) (make-pte 0 :present nil))
+        (flush-tlb-single candidate-virtual)
         ;; Maybe write it back to disk.
-        (when (logtest pte +page-table-dirty+)
+        (when dirty-p
           (when (not (block-info-committed-p bme))
             #+(or)(debug-print-line "Candidate is dirty but part of on-disk snapshot, allocating new block.")
             (let ((new-block (or (store-alloc 1)
@@ -557,8 +549,8 @@ Returns NIL if the entry is missing and ALLOCATE is false."
       #+(or)(debug-print-line "WFP " address " block " block-info)
       ;; Examine the page table, if there's a present entry then the page
       ;; was mapped while acquiring the VM lock. Just return.
-      (when (page-present-p pte 0)
-        (when (logtest (sys.int::memref-unsigned-byte-64 pte 0) +page-table-copy-on-write+)
+      (when (page-present-p pte)
+        (when (page-copy-on-write-p pte)
           (pager-log "Copying page " address " in WFP.")
           (snapshot-clone-cow-page (pager-allocate-page) address))
         #+(or)(debug-print-line "WFP " address " block " block-info " already mapped " (page-table-entry pte 0))
@@ -577,7 +569,7 @@ Returns NIL if the entry is missing and ALLOCATE is false."
              (is-zero-page nil))
         (setf (physical-page-frame-block-id frame) (block-info-block-id block-info)
               (physical-page-virtual-address frame) (logand address (lognot (1- +4k-page-size+))))
-        (when (not *page-replacement-list-head*)
+        (when t;(not *page-replacement-list-head*)
           (pager-log "addr " address " vaddr " (physical-page-virtual-address frame) " frame " frame " pteA " (get-pte-for-address address #+(or)(physical-page-virtual-address frame) nil) " pteB " (get-pte-for-address (physical-page-virtual-address frame) nil)))
         (append-to-page-replacement-list frame)
         (cond ((block-info-zero-fill-p block-info)
@@ -589,6 +581,8 @@ Returns NIL if the entry is missing and ALLOCATE is false."
                                                   sys.int::+block-map-flag-mask+
                                                   (lognot sys.int::+block-map-zero-fill+))))
               (t ;; Block must be read from disk.
+               (when (eql *paging-disk* :freestanding)
+                 (panic "Unable to satisfy paging request for page " address " while running freestanding"))
                (disk-submit-request *pager-disk-request*
                                     *paging-disk*
                                     :read
@@ -598,18 +592,16 @@ Returns NIL if the entry is missing and ALLOCATE is false."
                                     addr)
                (unless (disk-await-request *pager-disk-request*)
                  (panic "Unable to read page from disk"))))
-        (setf (page-table-entry pte 0) (logior (ash frame 12)
-                                               +page-table-present+
-                                               (if (block-info-writable-p block-info)
-                                                   +page-table-write+
-                                                 0)))
-        (sys.int::%invlpg address)
+        (setf (page-table-entry pte) (make-pte frame
+                                               :writable (block-info-writable-p block-info)))
+        (flush-tlb-single address)
         (when is-zero-page
           ;; Touch the page to make sure the snapshotter & swap code know to swap it out.
           ;; The zero fill flag in the block map was cleared, but the on-disk data doesn't reflect that.
           ;; This sets the dirty bits in the page tables properly.
           (setf (sys.int::memref-unsigned-byte-8 address 0) 0))
-        #+(or)(debug-print-line "WFP " address " block " block-info " mapped to " (page-table-entry pte 0)))))
+        #+(or)
+        (debug-print-line "WFP " address " block " block-info " mapped to " (page-table-entry pte 0)))))
   t)
 
 ;; Fast path, called from the page-fault handler.
@@ -644,16 +636,13 @@ Returns NIL if the entry is missing and ALLOCATE is false."
               (set-address-flags fault-address (logand block-info
                                                        sys.int::+block-map-flag-mask+
                                                        (lognot sys.int::+block-map-zero-fill+)))
-              (setf (page-table-entry pte 0) (logior (ash frame 12)
-                                                     +page-table-present+
-                                                     (if (block-info-writable-p block-info)
-                                                         +page-table-write+
-                                                         0)))
-              (sys.int::%invlpg fault-address)
               ;; Touch the page to make sure the snapshotter & swap code know to swap it out.
               ;; The zero fill flag in the block map was cleared, but the on-disk data doesn't reflect that.
               ;; This sets the dirty bits in the page tables properly.
-              (setf (sys.int::memref-unsigned-byte-8 fault-address 0) 0))
+              (setf (page-table-entry pte 0) (make-pte frame
+                                                       :writable (block-info-writable-p block-info)
+                                                       :dirty t))
+              (flush-tlb-single fault-address))
             t))))))
 
 (defun wait-for-page-via-interrupt (interrupt-frame address)
@@ -690,9 +679,9 @@ It will put the thread to sleep, while it waits for the page."
     (dotimes (i (truncate size #x1000))
       (let ((pte (get-pte-for-address (convert-to-pmap-address (+ base (* i #x1000))))))
         (when (not (page-present-p pte 0))
-          (setf (page-table-entry pte 0) (logior (+ base (* i #x1000))
-                                                 +page-table-present+
-                                                 +page-table-write+)))))))
+          (setf (page-table-entry pte 0) (make-pte (+ (truncate base #x1000) i)
+                                                   :writable t
+                                                   :wired t)))))))
 
 (defun initialize-pager ()
   (when (not (boundp '*pager-waiting-threads*))
@@ -752,7 +741,7 @@ It will put the thread to sleep, while it waits for the page."
                   (thread-wait-item sys.int::*pager-thread*) '*pager-waiting-threads*)
             (%run-on-wired-stack-without-interrupts (sp fp)
              (%reschedule-via-wired-stack sp fp))
-            (sys.int::%cli)
+            (%disable-interrupts)
             (acquire-place-spinlock (sys.int::symbol-global-value '*pager-lock*)))))
      (cond ((eql (thread-state *pager-current-thread*) :pager-request)
             (handle-pager-request))

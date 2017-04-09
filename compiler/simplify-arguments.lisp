@@ -79,6 +79,7 @@ Must be run after keywords have been lowered."
 (defmethod lower-arguments-1 ((form lambda-information))
   (flet ((new-var (name)
            (make-instance 'lexical-variable
+                          :inherit form
                           :name (gensym name)
                           :definition-point *current-lambda*)))
     (let* ((*current-lambda* form)
@@ -117,12 +118,13 @@ Must be run after keywords have been lowered."
                                               arg))))
                               (new-init-form (if trivial-init-form
                                                  init-form
-                                                 (ast '(quote nil)))))
+                                                 (ast '(quote nil) init-form))))
                          (when (or (not trivial-init-form)
                                    (typep arg 'special-variable))
                            (push (list arg (ast `(if ,new-suppliedp
                                                      ,new-arg
-                                                     ,init-form)))
+                                                     ,init-form)
+                                                init-form))
                                  extra-bindings))
                          (when (and (not (null suppliedp))
                                     (typep suppliedp 'special-variable))
@@ -136,9 +138,28 @@ Must be run after keywords have been lowered."
           (push (list (lambda-information-rest-arg form) new-rest)
                 extra-bindings)
           (setf (lambda-information-rest-arg form) new-rest)))
+      (when (and (lambda-information-fref-arg form)
+                 (typep (lambda-information-fref-arg form) 'special-variable))
+        (let ((new-fref (new-var (string (name (lambda-information-fref-arg form))))))
+          (push (list (lambda-information-fref-arg form) new-fref)
+                extra-bindings)
+          (setf (lambda-information-fref-arg form) new-fref)))
+      (when (and (lambda-information-closure-arg form)
+                 (typep (lambda-information-closure-arg form) 'special-variable))
+        (let ((new-closure (new-var (string (name (lambda-information-closure-arg form))))))
+          (push (list (lambda-information-closure-arg form) new-closure)
+                extra-bindings)
+          (setf (lambda-information-closure-arg form) new-closure)))
+      (when (and (lambda-information-count-arg form)
+                 (typep (lambda-information-count-arg form) 'special-variable))
+        (let ((new-count (new-var (string (name (lambda-information-count-arg form))))))
+          (push (list (lambda-information-count-arg form) new-count)
+                extra-bindings)
+          (setf (lambda-information-count-arg form) new-count)))
       (when extra-bindings
         ;; Bindings were added.
         (setf (lambda-information-body form)
               (ast `(let ,(reverse extra-bindings)
-                      ,(lambda-information-body form)))))
+                      ,(lambda-information-body form))
+                   form)))
       (lower-arguments-1 (lambda-information-body form)))))

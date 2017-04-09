@@ -38,6 +38,10 @@
   (:default-initargs :plist '()
                      :lock (mezzano.supervisor:make-mutex "Local File lock")))
 
+(defmethod print-object ((object local-file) stream)
+  (print-unreadable-object (object stream :type t :identity t)
+    (format stream "~S" (file-truename object))))
+
 (defclass local-stream (file-stream sys.gray:fundamental-stream sys.gray:unread-char-mixin)
   ((%file :initarg :file :reader local-stream-file)
    (%pathname :initarg :pathname :reader file-stream-pathname)
@@ -225,6 +229,24 @@
              (when position
                (aref container position))))))))
 
+(defmethod truename-using-host ((host local-file-host) pathname)
+  (cond ((and (pathname-directory pathname)
+              (not (pathname-name pathname))
+              (not (pathname-type pathname)))
+         ;; Special-case directory pathnames. The default implementation
+         ;; uses PROBE-FILE, which tries to open the file. It's not possible
+         ;; to open a directory using a #p"foo>bar>" style path.
+         (cond ((or (equal '(:absolute) (pathname-directory pathname))
+                    (equal '(:relative) (pathname-directory pathname)))
+                pathname)
+               (t
+                (call-next-method host (make-pathname :directory (butlast (pathname-directory pathname))
+                                                      :name (first (last (pathname-directory pathname)))
+                                                      :type "directory"
+                                                      :defaults pathname)))))
+        (t
+         (call-next-method))))
+
 (defun make-file (dir truename element-type)
   (let* ((time (get-universal-time))
          (name-table (aref (file-storage dir) 0))
@@ -249,7 +271,11 @@
     (let ((key (cons (pathname-name truename) (pathname-type truename)))
           (file (make-instance 'local-file
                                :truename truename
-                               :storage (make-array 0 :element-type element-type :adjustable t :fill-pointer 0)
+                               :storage (make-array 0
+                                                    :element-type element-type
+                                                    :adjustable t
+                                                    :fill-pointer 0
+                                                    :area :pinned)
                                :plist (list :creation-time time
                                             :write-time time))))
       (cond (container
@@ -290,10 +316,14 @@
                      dir)
                   (let ((next (read-directory-entry dir (car element) "directory")))
                     (when (not next)
-                      (error 'simple-file-error
-                             :pathname pathname
-                             :format-control "Subdirectory ~S does not exist."
-                             :format-arguments (list element)))
+                      (ecase if-does-not-exist
+                        ((:error :create)
+                         (error 'simple-file-error
+                                :pathname pathname
+                                :format-control "Subdirectory ~S does not exist."
+                                :format-arguments (list element)))
+                        ((nil)
+                         (return-from open-using-host nil))))
                     (setf dir next))))
            (file (read-directory-entry dir (pathname-name pathname) (pathname-type pathname) (pathname-version pathname)))
            (createdp nil)
@@ -328,7 +358,11 @@
            (setf superseded-file file
                  file (make-instance 'local-file
                                      :truename (file-truename file)
-                                     :storage (make-array 0 :element-type element-type :adjustable t :fill-pointer 0))))
+                                     :storage (make-array 0
+                                                          :element-type element-type
+                                                          :adjustable t
+                                                          :fill-pointer 0
+                                                          :area :pinned))))
           ((:overwrite :append)
            ???)
           ((nil) (return-from open-using-host nil))))
@@ -562,7 +596,7 @@
                (incf (stream-position stream))))
             (t :eof)))))
 
-(defmethod sys.gray:stream-write-sequence ((stream local-stream) sequence start end)
+(defmethod sys.gray:stream-write-sequence ((stream local-stream) sequence &optional (start 0) end)
   (check-type (direction stream) (member :io :output))
   (let ((file (local-stream-file stream)))
     (mezzano.supervisor:with-mutex ((file-lock file))
@@ -582,15 +616,22 @@
       (incf (stream-position stream) (- end start))
       (setf (getf (file-plist file) :write-time) (get-universal-time)))))
 
-#+(or)(defmethod sys.gray:stream-read-sequence ((stream local-stream) sequence start end)
+(defmethod sys.gray:stream-read-sequence ((stream local-stream) sequence &optional (start 0) end)
   (check-type (direction stream) (member :io :input))
-  (let ((file (local-stream-file stream)))
+  (let ((file (local-stream-file stream))
+        (end (or end (length sequence))))
     (mezzano.supervisor:with-mutex ((file-lock file))
-      (cond ((< (stream-position stream)
-                (length (file-storage file)))
-             (prog1 (aref (file-storage file) (stream-position stream))
-               (incf (stream-position stream))))
-            (t :eof)))))
+      (let* ((pos (stream-position stream))
+             (storage (file-storage file))
+             (file-size (length storage))
+             (requested-n-bytes (- end start))
+             (n-bytes (max 0 (min requested-n-bytes (- file-size pos)))))
+        (replace sequence storage
+                 :start1 start
+                 :start2 pos
+                 :end2 (+ pos n-bytes))
+        (incf (stream-position stream) n-bytes)
+        (+ start n-bytes)))))
 
 (defmethod sys.gray:stream-element-type ((stream local-stream))
   (array-element-type (file-storage (local-stream-file stream))))
@@ -605,6 +646,21 @@
                                             position-spec)))
         (t (stream-position stream))))
 
+(defmethod sys.gray:stream-line-column ((stream local-stream))
+  nil)
+
+(defmethod sys.gray:stream-line-length ((stream local-stream))
+  nil)
+
+(defmethod sys.gray:stream-clear-output ((stream local-stream))
+  nil)
+
+(defmethod sys.gray:stream-finish-output ((stream local-stream))
+  nil)
+
+(defmethod sys.gray:stream-force-output ((stream local-stream))
+  nil)
+
 (defmethod close ((stream local-stream) &key abort &allow-other-keys)
   (when (and (not abort)
              (superseded-file stream))
@@ -618,4 +674,12 @@
   t)
 
 (defmethod stream-truename ((stream local-stream))
-  (file-truename (local-stream-file stream)))
+  (let ((truename (file-truename (local-stream-file stream))))
+    (cond ((string= (pathname-type truename) "directory")
+           (make-pathname :directory (append (pathname-directory truename)
+                                             (list (pathname-name truename)))
+                          :name nil
+                          :type nil
+                          :defaults truename))
+          (t
+           truename))))

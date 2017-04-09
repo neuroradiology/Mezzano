@@ -80,14 +80,14 @@
 ;;; standard-class must be determined without making any further slot
 ;;; references.
 
-(defvar *the-class-standard-class*)    ;standard-class's class metaobject
-(defvar *the-class-funcallable-standard-class*)
-(defvar *the-class-standard-direct-slot-definition*)
-(defvar *the-class-standard-effective-slot-definition*)
-(defvar *the-class-t*)
-(defvar *standard-class-effective-slots-position*) ; Position of the effective-slots slot in standard-class.
-(defvar *standard-class-slot-storage-layout-position*)
-(defvar *standard-class-hash-position*)
+(sys.int::defglobal *the-class-standard-class*)    ;standard-class's class metaobject
+(sys.int::defglobal *the-class-funcallable-standard-class*)
+(sys.int::defglobal *the-class-standard-direct-slot-definition*)
+(sys.int::defglobal *the-class-standard-effective-slot-definition*)
+(sys.int::defglobal *the-class-t*)
+(sys.int::defglobal *standard-class-effective-slots-position*) ; Position of the effective-slots slot in standard-class.
+(sys.int::defglobal *standard-class-slot-storage-layout-position*)
+(sys.int::defglobal *standard-class-hash-position*)
 
 (defun slot-location (class slot-name)
   (if (and (eq slot-name 'effective-slots)
@@ -97,8 +97,8 @@
                         (class-slots class)
                         :key #'slot-definition-name)))
         (when (null slot)
-          (error "The slot ~S is missing from the class ~S."
-                 slot-name class))
+          (return-from slot-location
+            nil))
         (case (slot-definition-allocation slot)
           ((:instance :class)
            (slot-definition-location slot))
@@ -174,6 +174,10 @@
 (defun std-slot-value (instance slot-name)
   (multiple-value-bind (slots location)
       (slot-location-in-instance instance slot-name)
+    (when (not location)
+      (return-from std-slot-value
+        (values (slot-missing (class-of instance) instance
+                              slot-name 'slot-value))))
     (let ((val (slot-contents slots location)))
       (if (eq *secret-unbound-value* val)
           (values (slot-unbound (class-of instance) instance slot-name))
@@ -190,6 +194,10 @@
 (defun (setf std-slot-value) (value instance slot-name)
   (multiple-value-bind (slots location)
       (slot-location-in-instance instance slot-name)
+    (when (not location)
+      (slot-missing (class-of instance) instance slot-name 'setf value)
+      (return-from std-slot-value
+        value))
     (setf (slot-contents slots location) value)))
 (defun (setf slot-value) (new-value object slot-name)
   (cond ((std-class-p (class-of (class-of object)))
@@ -205,6 +213,10 @@
 (defun std-slot-boundp (instance slot-name)
   (multiple-value-bind (slots location)
       (slot-location-in-instance instance slot-name)
+    (when (not location)
+      (return-from std-slot-boundp
+        (values (slot-missing (class-of instance) instance
+                              slot-name 'slot-boundp))))
     (not (eq *secret-unbound-value* (slot-contents slots location)))))
 (defun slot-boundp (object slot-name)
   (let ((metaclass (class-of (class-of object))))
@@ -219,6 +231,10 @@
 (defun std-slot-makunbound (instance slot-name)
   (multiple-value-bind (slots location)
       (slot-location-in-instance instance slot-name)
+    (when (not location)
+      (return-from std-slot-makunbound
+        (values (slot-missing (class-of instance) instance
+                              slot-name 'slot-makunbound))))
     (setf (slot-contents slots location) *secret-unbound-value*))
   instance)
 (defun slot-makunbound (object slot-name)
@@ -233,6 +249,10 @@
 
 (defun slot-exists-p (instance slot-name)
   (not (null (find-effective-slot instance slot-name))))
+
+(defun slot-exists-in-class-p (class slot-name)
+  (not (null (find slot-name (class-slots class)
+                   :key #'slot-definition-name))))
 
 ;;; class-of
 
@@ -668,7 +688,7 @@ Other arguments are included directly."
 ;;; Generic function metaobjects and standard-generic-function
 ;;;
 
-(defvar *the-class-standard-gf*) ;standard-generic-function's class metaobject
+(sys.int::defglobal *the-class-standard-gf*) ;standard-generic-function's class metaobject
 
 (defun generic-function-name (gf)
   (slot-value gf 'name))
@@ -736,7 +756,7 @@ Other arguments are included directly."
 ;;; Method metaobjects and standard-method
 ;;;
 
-(defvar *the-class-standard-method*)    ;standard-method's class metaobject
+(sys.int::defglobal *the-class-standard-method*)    ;standard-method's class metaobject
 
 (defun method-lambda-list (method) (slot-value method 'lambda-list))
 (defun (setf method-lambda-list) (new-value method)
@@ -852,6 +872,17 @@ has only has class specializer."
           (analyze-lambda-list
             (generic-function-lambda-list gf))))
     (getf plist ':required-args)))
+
+(defun gf-optional-arglist (gf)
+  (let ((plist
+          (analyze-lambda-list
+            (generic-function-lambda-list gf))))
+    (getf plist ':optional-args)))
+
+(defun gf-rest-arg-p (gf)
+  (let ((ll (generic-function-lambda-list gf)))
+    (or (member '&rest ll)
+        (member '&key ll))))
 
 (defun finalize-generic-function (gf)
   (let* ((required-args (gf-required-arglist gf))
@@ -971,6 +1002,32 @@ has only has class specializer."
     (setf (method-function method) function)
     method))
 
+(defun check-method-lambda-list-congruence (gf method)
+  "Ensure that the lambda lists of GF and METHOD are compatible."
+  (let ((gf-ll (analyze-lambda-list (generic-function-lambda-list gf)))
+        (method-ll (analyze-lambda-list (method-lambda-list method))))
+    (assert (eql (length (getf gf-ll :required-args))
+                 (length (getf method-ll :required-args)))
+            (gf method)
+            "Generic function ~S and method ~S have differing required arguments."
+            gf method)
+    (assert (eql (length (getf gf-ll :optional-args))
+                 (length (getf method-ll :optional-args)))
+            (gf method)
+            "Generic function ~S and method ~S have differing optional arguments."
+            gf method)
+    (let ((gf-accepts-key-or-rest (or (getf gf-ll :rest-var)
+                                      (member '&key (generic-function-lambda-list gf))))
+          (method-accepts-key-or-rest (or (getf method-ll :rest-var)
+                                          (member '&key (method-lambda-list method)))))
+      (assert (or (and gf-accepts-key-or-rest
+                       method-accepts-key-or-rest)
+                  (and (not gf-accepts-key-or-rest)
+                       (not method-accepts-key-or-rest)))
+              (gf method)
+            "Generic function ~S and method ~S differ in their acceptance of &KEY or &REST arguments."
+            gf method))))
+
 ;;; add-method
 
 ;;; N.B. This version first removes any existing method on the generic function
@@ -983,6 +1040,8 @@ has only has class specializer."
   (when (and (endp (generic-function-methods gf))
              (endp (generic-function-lambda-list gf)))
     (setf (generic-function-lambda-list gf) (method-lambda-list method)))
+  (check-method-lambda-list-congruence gf method)
+  (assert (not (method-generic-function method)))
   (let ((old-method
            (find-method gf (method-qualifiers method)
                            (method-specializers method) nil)))
@@ -993,7 +1052,7 @@ has only has class specializer."
     (when (typep specializer 'class)
       (pushnew method (class-direct-methods specializer))))
   (finalize-generic-function gf)
-  method)
+  gf)
 
 (defun remove-method (gf method)
   (setf (generic-function-methods gf)
@@ -1004,10 +1063,18 @@ has only has class specializer."
       (setf (class-direct-methods class)
             (remove method (class-direct-methods class)))))
   (finalize-generic-function gf)
-  method)
+  gf)
 
 (defun find-method (gf qualifiers specializers
                     &optional (errorp t))
+  (setf specializers (loop
+                        for spec in specializers
+                        collect (if (and (consp spec)
+                                         (eql (first spec) 'eql))
+                                    (intern-eql-specializer (second spec))
+                                    spec)))
+  (assert (eql (length specializers)
+               (length (gf-required-arglist gf))))
   (let ((method
           (find-if #'(lambda (method)
                        (and (equal qualifiers
@@ -1027,11 +1094,10 @@ has only has class specializer."
                              :lambda-list '(object)
                              :qualifiers ()
                              :specializers (list class)
-                             :function (lambda (args next-emfun)
-                                         (declare (ignore next-emfun))
-                                         (apply (lambda (object)
-                                                  (slot-value object slot-name))
-                                                args))
+                             :function (lambda (method next-emfun)
+                                         (declare (ignore method next-emfun))
+                                         (lambda (object)
+                                           (slot-value object slot-name)))
                              :slot-definition slot-name))
   (values))
 
@@ -1041,11 +1107,10 @@ has only has class specializer."
                              :lambda-list '(new-value object)
                              :qualifiers ()
                              :specializers (list (find-class 't) class)
-                             :function (lambda (args next-emfun)
-                                         (declare (ignore next-emfun))
-                                         (apply (lambda (new-value object)
-                                                  (setf (slot-value object slot-name) new-value))
-                                                args))
+                             :function (lambda (method next-emfun)
+                                         (declare (ignore method next-emfun))
+                                         (lambda (new-value object)
+                                           (setf (slot-value object slot-name) new-value)))
                              :slot-definition slot-name))
   (values))
 
@@ -1056,7 +1121,7 @@ has only has class specializer."
 ;;; compute-discriminating-function
 
 (defun compute-reader-discriminator (gf emf-table argument-offset)
-  (lambda (object) ;ehhh...
+  (lambda (object)
     (let* ((class (class-of object))
            (location (single-dispatch-emf-entry emf-table class)))
       (if location
@@ -1064,7 +1129,7 @@ has only has class specializer."
           (slow-single-dispatch-method-lookup* gf argument-offset (list object) :reader)))))
 
 (defun compute-writer-discriminator (gf emf-table argument-offset)
-  (lambda (new-value object) ;ehhh...
+  (lambda (new-value object)
     (let* ((class (class-of object))
            (location (single-dispatch-emf-entry emf-table class)))
       (if location
@@ -1072,12 +1137,51 @@ has only has class specializer."
           (slow-single-dispatch-method-lookup* gf argument-offset (list new-value object) :writer)))))
 
 (defun compute-1-effective-discriminator (gf emf-table argument-offset)
-  (lambda (&rest args)
-    (let* ((class (class-of (nth argument-offset args)))
-           (emfun (single-dispatch-emf-entry emf-table class)))
-      (if emfun
-          (funcall emfun args)
-          (slow-single-dispatch-method-lookup gf args class)))))
+  ;; Generate specialized dispatch functions for various combinations of
+  ;; arguments.
+  (macrolet ((gen-one (index n-required restp)
+               (let ((req-args (loop
+                                  for i below n-required
+                                  collect (gensym)))
+                     (rest-arg (when restp
+                                 (gensym))))
+                 `(when (and (eql ',index argument-offset)
+                             (eql (length (gf-required-arglist gf)) ',n-required)
+                             (eql (length (gf-optional-arglist gf)) '0)
+                             (or (and ',restp (gf-rest-arg-p gf))
+                                 (and (not ',restp) (not (gf-rest-arg-p gf)))))
+                    (lambda (,@req-args ,@(if rest-arg
+                                              `(&rest ,rest-arg)
+                                              '()))
+                      (declare (sys.int::lambda-name (1-effective-discriminator ,index ,n-required ,restp)))
+                      (let* ((class (class-of ,(nth index req-args)))
+                             (emfun (single-dispatch-emf-entry emf-table class)))
+                        (if emfun
+                            ,(if rest-arg
+                                 `(apply emfun ,@req-args ,rest-arg)
+                                 `(funcall emfun ,@req-args))
+                            (slow-single-dispatch-method-lookup
+                             gf
+                             ,(if rest-arg
+                                  `(list* ,@req-args ,rest-arg)
+                                  `(list ,@req-args))
+                             class)))))))
+             (gen-all ()
+               `(or
+                 ,@(loop
+                      for idx from 0 below 5
+                      appending
+                        (loop
+                           for req from 1 to 5
+                           collect `(gen-one ,idx ,req nil)
+                           collect `(gen-one ,idx ,req t))))))
+    (or (gen-all)
+        (lambda (&rest args)
+          (let* ((class (class-of (nth argument-offset args)))
+                 (emfun (single-dispatch-emf-entry emf-table class)))
+            (if emfun
+                (apply emfun args)
+                (slow-single-dispatch-method-lookup gf args class)))))))
 
 (defun compute-n-effective-discriminator (gf emf-table n-required-args)
   (lambda (&rest args)
@@ -1088,7 +1192,7 @@ has only has class specializer."
     (let* ((classes (mapcar #'class-of (subseq args 0 n-required-args)))
            (emfun (gethash classes emf-table nil)))
       (if emfun
-          (funcall emfun args)
+          (apply emfun args)
           (slow-method-lookup gf args classes)))))
 
 (defun slow-single-dispatch-method-lookup* (gf argument-offset args state)
@@ -1104,8 +1208,10 @@ has only has class specializer."
          (cond ((and (not (null applicable-methods))
                      (every 'primary-method-p applicable-methods)
                      (typep (first applicable-methods) 'standard-reader-method)
-                     (std-class-p (class-of class)))
+                     (std-class-p (class-of class))
+                     (slot-exists-in-class-p class (slot-value (first applicable-methods) 'slot-definition)))
                 (let ((location (slot-location class (slot-value (first applicable-methods) 'slot-definition))))
+                  (assert location)
                   (setf (single-dispatch-emf-entry emf-table class) location)
                   (pushnew gf (class-dependents class))
                   (fast-slot-read (first args) location)))
@@ -1121,8 +1227,10 @@ has only has class specializer."
          (cond ((and (not (null applicable-methods))
                      (every 'primary-method-p applicable-methods)
                      (typep (first applicable-methods) 'standard-writer-method)
-                     (std-class-p (class-of class)))
+                     (std-class-p (class-of class))
+                     (slot-exists-in-class-p class (slot-value (first applicable-methods) 'slot-definition)))
                 (let ((location (slot-location class (slot-value (first applicable-methods) 'slot-definition))))
+                  (assert location)
                   (setf (single-dispatch-emf-entry emf-table class) location)
                   (pushnew gf (class-dependents class))
                   (fast-slot-write (first args) (second args) location)))
@@ -1187,14 +1295,14 @@ has only has class specializer."
                              #'compute-effective-method-function)
                          gf applicable-methods))
                        (t
-                        (lambda (args)
+                        (lambda (&rest args)
                           (apply #'no-applicable-method gf args))))))
       ;; Cache is only valid for non-eql methods.
       (when validp
         (setf (gethash classes (classes-to-emf-table gf)) emfun)
         (dolist (class classes)
           (pushnew gf (class-dependents class))))
-      (funcall emfun args))))
+      (apply emfun args))))
 
 (defun slow-single-dispatch-method-lookup (gf args class)
   (let* ((classes (mapcar #'class-of
@@ -1206,11 +1314,11 @@ has only has class specializer."
     (let ((emfun (cond (applicable-methods
                         (std-compute-effective-method-function gf applicable-methods))
                        (t
-                        (lambda (args)
+                        (lambda (&rest args)
                           (apply #'no-applicable-method gf args))))))
       (setf (single-dispatch-emf-entry (classes-to-emf-table gf) class) emfun)
       (pushnew gf (class-dependents class))
-      (funcall emfun args))))
+      (apply emfun args))))
 
 ;;; compute-applicable-methods-using-classes
 
@@ -1260,36 +1368,34 @@ has only has class specializer."
            method-specializers))))
 
 (defun method-more-specific-p (gf method1 method2 required-classes)
-  (mapc #'(lambda (spec1 spec2 arg-class)
-            (cond ((and (typep spec1 'eql-specializer)
-                        (not (typep spec2 'eql-specializer)))
-                   (return-from method-more-specific-p t))
-                  ((and (typep spec1 'eql-specializer)
-                        (typep spec2 'eql-specializer))
-                   (return-from method-more-specific-p nil))
-                  (t (unless (eq spec1 spec2)
-                       (return-from method-more-specific-p
-                         (sub-specializer-p spec1 spec2 arg-class))))))
-        (reorder-method-specializers gf (method-specializers method1))
-        (reorder-method-specializers gf (method-specializers method2))
-        (reorder-method-specializers gf required-classes))
-  nil)
+  (loop
+     for spec1 in (reorder-method-specializers gf (method-specializers method1))
+     for spec2 in (reorder-method-specializers gf (method-specializers method2))
+     for arg-class in (reorder-method-specializers gf required-classes)
+     do (cond ((and (typep spec1 'eql-specializer)
+                    (not (typep spec2 'eql-specializer)))
+               (return t))
+              ((and (typep spec1 'eql-specializer)
+                    (typep spec2 'eql-specializer))
+               (return nil))
+              ((not (eq spec1 spec2))
+               (return (sub-specializer-p spec1 spec2 arg-class))))
+     finally (return nil)))
 
 (defun method-more-specific-with-args-p (gf method1 method2 args)
-  (mapc #'(lambda (spec1 spec2 arg)
-            (cond ((and (typep spec1 'eql-specializer)
-                        (not (typep spec2 'eql-specializer)))
-                   (return-from method-more-specific-with-args-p t))
-                  ((and (typep spec1 'eql-specializer)
-                        (typep spec2 'eql-specializer))
-                   (return-from method-more-specific-with-args-p nil))
-                  (t (unless (eq spec1 spec2)
-                       (return-from method-more-specific-with-args-p
-                         (sub-specializer-p spec1 spec2 (class-of arg)))))))
-        (reorder-method-specializers gf (method-specializers method1))
-        (reorder-method-specializers gf (method-specializers method2))
-        (reorder-method-specializers gf args))
-  nil)
+  (loop
+     for spec1 in (reorder-method-specializers gf (method-specializers method1))
+     for spec2 in (reorder-method-specializers gf (method-specializers method2))
+     for arg in (reorder-method-specializers gf args)
+     do (cond ((and (typep spec1 'eql-specializer)
+                    (not (typep spec2 'eql-specializer)))
+               (return t))
+              ((and (typep spec1 'eql-specializer)
+                    (typep spec2 'eql-specializer))
+               (return nil))
+              ((not (eq spec1 spec2))
+               (return (sub-specializer-p spec1 spec2 (class-of arg)))))
+     finally (return nil)))
 
 ;;; compute-effective-method-function
 
@@ -1304,13 +1410,14 @@ has only has class specializer."
 
 ;;; compute an effective method function from a list of primary methods:
 
+(defun method-fast-function (method next-emfun)
+  (funcall (method-function method) method next-emfun))
+
 (defun compute-primary-emfun (methods)
   (if (null methods)
       nil
-      (let ((next-emfun (compute-primary-emfun (cdr methods)))
-            (fn (method-function (car methods))))
-        #'(lambda (args)
-            (funcall fn args next-emfun)))))
+      (let ((next-emfun (compute-primary-emfun (cdr methods))))
+        (method-fast-function (car methods) next-emfun))))
 
 (defun std-compute-effective-method-function-with-standard-method-combination (gf methods)
   (let ((primaries (remove-if-not #'primary-method-p methods))
@@ -1323,42 +1430,43 @@ has only has class specializer."
                    (if (eq (class-of gf) *the-class-standard-gf*)
                        #'std-compute-effective-method-function
                        #'compute-effective-method-function)
-                   gf (remove around methods)))
-              (around-fn (method-function around)))
-          #'(lambda (args)
-              (funcall around-fn args next-emfun)))
-        (let ((next-emfun (compute-primary-emfun (cdr primaries)))
-              (primary (method-function (car primaries)))
-              (befores (mapcar 'method-function (remove-if-not #'before-method-p methods)))
-              (reverse-afters
-                (mapcar 'method-function (reverse (remove-if-not #'after-method-p methods)))))
+                   gf (remove around methods))))
+          (method-fast-function around next-emfun))
+        (let ((primary (compute-primary-emfun primaries))
+              (befores (mapcar (lambda (m) (method-fast-function m nil))
+                               (remove-if-not #'before-method-p methods)))
+              (reverse-afters (mapcar (lambda (m) (method-fast-function m nil))
+                                      (reverse (remove-if-not #'after-method-p methods)))))
           (cond ((and befores reverse-afters)
-                 (lambda (args)
+                 (lambda (&rest args)
+                   (declare (dynamic-extent args))
                    (dolist (before befores)
-                     (funcall before args nil))
+                     (apply before args))
                    (multiple-value-prog1
-                       (funcall primary args next-emfun)
+                       (apply primary args)
                      (dolist (after reverse-afters)
-                       (funcall after args nil)))))
+                       (apply after args)))))
                 (befores
-                 (lambda (args)
+                 (lambda (&rest args)
+                   (declare (dynamic-extent args))
                    (dolist (before befores)
-                     (funcall before args nil))
-                   (funcall primary args next-emfun)))
+                     (apply before args))
+                   (apply primary args)))
                 (reverse-afters
-                 (lambda (args)
+                 (lambda (&rest args)
+                   (declare (dynamic-extent args))
                    (multiple-value-prog1
-                       (funcall primary args next-emfun)
+                       (apply primary args)
                      (dolist (after reverse-afters)
-                       (funcall after args nil)))))
-                (t (lambda (args)
-                     (funcall primary args next-emfun))))))))
+                       (apply after args)))))
+                (t
+                 primary))))))
 
 (defun generate-method-combination-effective-method (name effective-method-body)
   (let ((method-args (gensym "ARGS"))
         (next-emfun (gensym "NEXT-EMFUN")))
-    `(lambda (,method-args)
-       (declare (system:lambda-name (effective-method ,@name)))
+    `(lambda (&rest ,method-args)
+       (declare (sys.int::lambda-name (effective-method ,@name)))
        (macrolet ((call-method (method &optional next-method-list)
                     (when (listp method)
                       (assert (eql (first method) 'make-method)))
@@ -1367,13 +1475,14 @@ has only has class specializer."
                            (assert (eql (length method) 2))
                            (second method))
                           (t
-                           `(funcall ',(method-function method)
-                                     ,',method-args
-                                     ,(if next-method-list
-                                          `(lambda (,',method-args)
-                                             (call-method ,(first next-method-list)
-                                                          ,(rest next-method-list)))
-                                          nil)))))
+                           `(apply (funcall ',(method-function method)
+                                            ',method
+                                            ,(if next-method-list
+                                                 `(lambda (&rest ,',method-args)
+                                                    (call-method ,(first next-method-list)
+                                                                 ,(rest next-method-list)))
+                                                 nil))
+                                   ,',method-args))))
                   (make-method (form)
                     (error "MAKE-METHOD must be either the method argument or a next-method supplied to CALL-METHOD.")))
          ,effective-method-body))))
@@ -1476,7 +1585,7 @@ has only has class specializer."
       (loop
          for (initarg form fn) in (class-direct-default-initargs c)
          do (when (and (not (member initarg initargs))
-                       (not (member initargs default-initargs)))
+                       (not (member initarg default-initargs)))
               (push initarg default-initargs)
               (push (funcall fn) default-initargs))))
     (append initargs (nreverse default-initargs))))
@@ -1490,16 +1599,16 @@ has only has class specializer."
 (defmethod make-instance ((class symbol) &rest initargs)
   (apply #'make-instance (find-class class) initargs))
 
-(defgeneric initialize-instance (instance &key))
+(defgeneric initialize-instance (instance &key &allow-other-keys))
 (defmethod initialize-instance ((instance standard-object) &rest initargs)
   (apply #'shared-initialize instance t initargs))
 
-(defgeneric reinitialize-instance (instance &key))
+(defgeneric reinitialize-instance (instance &key &allow-other-keys))
 (defmethod reinitialize-instance
            ((instance standard-object) &rest initargs)
   (apply #'shared-initialize instance () initargs))
 
-(defgeneric shared-initialize (instance slot-names &key))
+(defgeneric shared-initialize (instance slot-names &key &allow-other-keys))
 (defmethod shared-initialize ((instance standard-object)
                               slot-names &rest all-keys)
   (dolist (slot (class-slots (class-of instance)))
@@ -1520,7 +1629,7 @@ has only has class specializer."
 
 ;;; change-class
 
-(defgeneric change-class (instance new-class &key))
+(defgeneric change-class (instance new-class &key &allow-other-keys))
 (defmethod change-class
            ((old-instance standard-object)
             (new-class standard-class)
@@ -1546,7 +1655,7 @@ has only has class specializer."
            ((instance standard-object) (new-class symbol) &rest initargs)
   (apply #'change-class instance (find-class new-class) initargs))
 
-(defgeneric update-instance-for-different-class (old new &key))
+(defgeneric update-instance-for-different-class (old new &key &allow-other-keys))
 (defmethod update-instance-for-different-class
            ((old standard-object) (new standard-object) &rest initargs)
   (let ((added-slots
@@ -1666,25 +1775,6 @@ has only has class specializer."
 (defmethod compute-effective-method ((gf standard-generic-function) method-combination methods)
   (std-compute-effective-method gf method-combination methods))
 
-;;; describe-object is a handy tool for enquiring minds:
-
-(defgeneric describe-object (object stream))
-(defmethod describe-object ((object standard-object) stream)
-  (format stream "A Closette object~%~
-             Printed representation: ~S~%~
-             Class: ~S~%~
-             Structure~%"
-          object
-          (class-of object))
-  (dolist (sn (mapcar #'slot-definition-name
-                      (class-slots (class-of object))))
-    (if (slot-boundp object sn)
-        (format stream "    ~S <- ~S~%"
-                sn
-                (slot-value object sn))
-        (format stream "    ~S <- not bound~%" sn)))
-  (values))
-
 (format t "Closette is a Knights of the Lambda Calculus production.~%")
 
 ;;; Metaclasses.
@@ -1761,6 +1851,16 @@ has only has class specializer."
 (defclass structure-class (clos-class)
   ((structure-definition :initarg :definition)))
 
+(defmethod allocate-instance ((class structure-class) &rest initargs)
+  (declare (ignore initargs))
+  (let* ((def (slot-value class 'structure-definition))
+         (slots (sys.int::structure-slots def))
+         (n-slots (length slots))
+         (struct (sys.int::%make-struct (1+ n-slots)
+                                        (sys.int::structure-area def))))
+    (setf (sys.int::%struct-slot struct 0) def)
+    struct))
+
 (defmethod direct-slot-definition-class ((class structure-class) &rest initargs)
   *the-class-standard-direct-slot-definition*)
 (defmethod effective-slot-definition-class ((class structure-class) &rest initargs)
@@ -1796,6 +1896,12 @@ has only has class specializer."
           (error "The slot ~S in class ~S is read-only." slot-name (class-name class)))
         (return (funcall `(setf ,(sys.int::structure-slot-accessor slot)) new-value instance))))))
 
+(defmethod slot-boundp-using-class ((class structure-class) instance (slot standard-effective-slot-definition))
+  t)
+
+(defmethod slot-makunbound-using-class ((class structure-class) instance (slot standard-effective-slot-definition))
+  (error "Cannot make structure slots unbound."))
+
 (defmethod finalize-inheritance ((class structure-class))
   (std-finalize-inheritance class)
   (values))
@@ -1819,7 +1925,7 @@ has only has class specializer."
 
 ;;; eql specializers.
 
-(defvar *interned-eql-specializers* (make-hash-table))
+(sys.int::defglobal *interned-eql-specializers* (make-hash-table))
 
 (defclass eql-specializer (specializer)
   ((object :initarg :object :reader eql-specializer-object)))

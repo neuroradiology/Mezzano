@@ -20,18 +20,35 @@
 (defmethod kt-form ((form lexical-variable) &optional target-variable replacement-form)
   (cond ((eql form target-variable)
          (change-made)
-         (values (ast `(call values ,replacement-form))
+         (values (ast `(call values ,replacement-form) form)
                  t))
         (t (values form nil))))
 
-(defun kt-implicit-progn (x &optional target-variable replacement-form)
-  (when x
-    ;; Only push through the first form.
-    (multiple-value-bind (first-form did-replace)
-        (kt-form (first x) target-variable replacement-form)
-      (values (list* first-form
-                     (mapcar #'kt-form (rest x)))
-              did-replace))))
+(defun kt-implicit-progn (forms &optional target-variable replacement-form)
+  (let ((did-something nil))
+    (values
+     (loop
+        with saw-impure = nil
+        for form in forms
+        collect (cond
+                  ((or saw-impure
+                       did-something
+                       (typep (unwrap-the form) '(or ast-quote ast-function lambda-information)))
+                   (kt-form form))
+                  ((typep (unwrap-the form) 'lexical-variable)
+                   (multiple-value-bind (new did-replace)
+                       (kt-form form target-variable replacement-form)
+                     (when did-replace
+                       (setf did-something t))
+                     new))
+                  (t
+                   (setf saw-impure t)
+                   (multiple-value-bind (new did-replace)
+                       (kt-form form target-variable replacement-form)
+                     (when did-replace
+                       (setf did-something t))
+                     new))))
+     did-something)))
 
 (defmethod kt-form ((form lambda-information) &optional target-variable replacement-form)
   (declare (ignore target-variable replacement-form))
@@ -49,7 +66,7 @@
       (kt-implicit-progn (arguments form)
                          target-variable
                          replacement-form)
-    (values (ast `(call ,(name form) ,@new-list))
+    (values (ast `(call ,(name form) ,@new-list) form)
             did-replace)))
 
 (defun temporary-p (varlike)
@@ -119,7 +136,8 @@
                (unless replaced-last-binding
                  (push (car (last bindings)) new-bindings))
                (values (ast `(let ,(reverse new-bindings)
-                               ,new-form))
+                               ,new-form)
+                            form)
                        did-replace)))))))
 
 (defmethod kt-form ((form ast-multiple-value-bind) &optional target-variable replacement-form)
