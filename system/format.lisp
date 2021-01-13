@@ -1,10 +1,9 @@
-;;;; Copyright (c) 2011-2016 Henry Harrington <henry.harrington@gmail.com>
-;;;; This code is licensed under the MIT license.
+;;;; Early FORMAT
 
-(cl:defpackage :sys.format
-  (:use :cl #:sys.int))
+(defpackage :mezzano.format
+  (:use :cl))
 
-(in-package :sys.format)
+(in-package :mezzano.format)
 
 (defstruct directive
   character
@@ -190,7 +189,7 @@
         (colon-sym (or colon (gensym "Colon"))))
     `(setf (format-interpreter ',character)
            (lambda (,arguments ,at-sign-sym ,colon-sym ,@parameter-lambda-list)
-             (declare (sys.int::lambda-name (format-interpreter ,character)))
+             (declare (mezzano.internals::lambda-name (format-interpreter ,character)))
              (block nil
                ,@(when (not at-sign)
                        (list `(when ,at-sign-sym
@@ -413,7 +412,7 @@
 (define-format-interpreter #\$ (at-sign colon &optional (d 2) (n 1) (w 0) (padchar #\Space))
   (let ((arg (consume-argument)))
     (when (realp arg)
-      (setf arg (float 0.0s0)))
+      (setf arg (float 0.0f0)))
     (format t "~D" arg)))
 
 ;;;; 22.3.4 FORMAT Printer Operations.
@@ -483,11 +482,11 @@
         (at-sign
          (dotimes (i colnum)
            (write-char #\Space))
-         (let ((current (sys.gray:stream-line-column *standard-output*)))
+         (let ((current (mezzano.gray:stream-line-column *standard-output*)))
            (when current
              (dotimes (i (- colinc (rem current colinc)))
                (write-char #\Space)))))
-        (t (let ((current (sys.gray:stream-line-column *standard-output*)))
+        (t (let ((current (mezzano.gray:stream-line-column *standard-output*)))
              (cond ((not current)
                     (write-string "  "))
                    ((< current colnum)
@@ -613,7 +612,7 @@
   (when params (error "~~( Expects no parameters."))
   (when (or end-at-sign end-colon)
     (error "~~) does not take the at-sign or colon modifiers."))
-  (let ((*standard-output* (sys.int::make-case-correcting-stream
+  (let ((*standard-output* (mezzano.internals::make-case-correcting-stream
                             *standard-output*
                             (cond ((and colon at-sign)
                                    :upcase)
@@ -709,9 +708,12 @@
          (do-format stream)))
       ((and (stringp destination)
             (array-has-fill-pointer-p destination))
-       (do-format (make-instance 'sys.int::string-output-stream
-                                 :element-type 'character
-                                 :string destination)))
+       (do-format (locally
+                      ;; ### Bootstrap hack.
+                      (declare (notinline make-instance))
+                    (make-instance 'mezzano.internals::string-output-stream
+                                   :element-type 'character
+                                   :string destination))))
       ((eql destination 't)
        (do-format *standard-output*))
       ((streamp destination)

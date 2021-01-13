@@ -1,6 +1,3 @@
-;;;; Copyright (c) 2011-2016 Henry Harrington <henry.harrington@gmail.com>
-;;;; This code is licensed under the MIT license.
-
 ;;; High-level interrupt management.
 
 (in-package :mezzano.supervisor)
@@ -23,9 +20,8 @@
   (sys.lap-x86:ret)
   BAD
   (:gc :frame)
-  (sys.lap-x86:mov64 :r13 (:function panic-not-on-wired-stack))
   (sys.lap-x86:mov32 :ecx #.(ash 0 sys.int::+n-fixnum-bits+))
-  (sys.lap-x86:call (:object :r13 #.sys.int::+fref-entry-point+))
+  (sys.lap-x86:call (:named-call panic-not-on-wired-stack))
   (sys.lap-x86:ud2))
 
 (defun panic-not-on-wired-stack ()
@@ -56,7 +52,7 @@
 ;; to the CPU's wired stack for the duration of the call.
 ;; %C-O-W-S-W-I must not be exited using a non-local exit.
 ;; %RESCHEDULE and similar functions must not be called.
-(sys.int::define-lap-function %call-on-wired-stack-without-interrupts ()
+(sys.int::define-lap-function %call-on-wired-stack-without-interrupts ((function unused-must-be-nil &optional arg1 arg2 arg3))
   (:gc :no-frame :layout #*0)
   ;; Argument setup.
   (sys.lap-x86:mov64 :rbx :r8) ; function
@@ -81,7 +77,7 @@
   (sys.lap-x86:cli)
   ;; Switch over to the wired stack.
   (sys.lap-x86:fs)
-  (sys.lap-x86:mov64 :rsp (#.+cpu-info-wired-stack-offset+))
+  (sys.lap-x86:mov64 :rsp (:object-location nil #.+cpu-wired-stack-pointer+))
   ;; Call function, argument were setup above.
   (sys.lap-x86:call (:object :rbx 0))
   (:gc :frame :multiple-values 0)
@@ -187,35 +183,31 @@ If clear, the fault occured in supervisor mode.")
   (panic reason " on address " address))
 
 (defun sys.int::%page-fault-handler (interrupt-frame info)
-  (let* ((fault-addr (sys.int::%cr2)))
-    (when (and (boundp '*page-fault-hook*)
-               *page-fault-hook*)
-      (funcall *page-fault-hook* interrupt-frame info fault-addr))
-    (cond ((not *paging-disk*)
+  (let* ((fault-addr (sys.int::%cr2))
+         (ist-state (disable-page-fault-ist)))
+    (when (local-cpu-page-fault-hook)
+      (funcall (local-cpu-page-fault-hook) interrupt-frame info fault-addr ist-state))
+    (cond ((not ist-state)
+           (fatal-page-fault interrupt-frame info "Nested page faults" fault-addr))
+          ((not *paging-disk*)
            (fatal-page-fault interrupt-frame info "Early page fault" fault-addr))
           ((not (logtest #x200 (interrupt-frame-raw-register interrupt-frame :rflags)))
            ;; IRQs must be enabled when a page fault occurs.
            (fatal-page-fault interrupt-frame info "Page fault with interrupts disabled" fault-addr))
-          ((or (<= 0 fault-addr (1- (* 2 1024 1024 1024)))
-               (<= (ash sys.int::+address-tag-stack+ sys.int::+address-tag-shift+)
-                   fault-addr
-                   (+ (ash sys.int::+address-tag-stack+ sys.int::+address-tag-shift+)
-                      (* 512 1024 1024 1024))))
-           ;; Pages below 2G are wired and should never be unmapped or protected.
-           ;; Same for pages in the wired stack area.
+          ((and (eql (thread-priority (current-thread)) :supervisor)
+                (address-in-non-faulting-range-p fault-addr))
            (fatal-page-fault interrupt-frame info "Page fault in wired area" fault-addr))
-          ((and (logbitp +page-fault-error-present+ info)
-                (logbitp +page-fault-error-write+ info))
-           ;; Copy on write page, might not return.
-           (snapshot-clone-cow-page-via-page-fault interrupt-frame fault-addr))
           ;; All impossible.
-          ((or (logbitp +page-fault-error-present+ info)
-               (logbitp +page-fault-error-user+ info)
+          ((or (logbitp +page-fault-error-user+ info)
                (logbitp +page-fault-error-reserved-violation+ info))
            (fatal-page-fault interrupt-frame info "Page fault" fault-addr))
-          (t ;; Non-present page. Try to load it from the store.
+          (t ;; Defer to the pager.
            ;; Might not return.
-           (wait-for-page-via-interrupt interrupt-frame fault-addr)))))
+           (wait-for-page-via-interrupt interrupt-frame
+                                        fault-addr
+                                        (logbitp +page-fault-error-write+ info)
+                                        ist-state)))
+    (restore-page-fault-ist ist-state)))
 
 (defun sys.int::%math-fault-handler (interrupt-frame info)
   (unhandled-interrupt interrupt-frame info "math fault"))
@@ -227,7 +219,9 @@ If clear, the fault occured in supervisor mode.")
   (unhandled-interrupt interrupt-frame info "machine check"))
 
 (defun sys.int::%simd-exception-handler (interrupt-frame info)
-  (unhandled-interrupt interrupt-frame info "simd exception"))
+  (declare (ignore info))
+  (debug-print-line "signalling simd exception " (current-thread))
+  (pager-invoke-via-interrupt #'mezzano.runtime::%raise-simd-exception interrupt-frame nil))
 
 (defun sys.int::%user-interrupt-handler (interrupt-frame info)
   (let ((handler (svref *user-interrupt-handlers* info)))
@@ -245,14 +239,41 @@ If clear, the fault occured in supervisor mode.")
   "Caches the current IRQ mask, so it doesn't need to be read from the PIC when being modified.")
 (sys.int::defglobal *i8259-spinlock* nil
   "Lock serializing access to i8259 and associated variables.")
-(sys.int::defglobal *i8259-handlers* nil)
+(sys.int::defglobal *i8259-irqs* nil)
+(sys.int::defglobal *i8259-reported-spurious-interrupt*)
+(sys.int::defglobal *i8259-spurious-interrupt-count*)
+
+(defun i8259-irq-spurious-p (irq)
+  ;; Only IRQs 7 and 15 can be spurious.
+  (cond ((eql irq 7)
+         (setf (sys.int::io-port/8 #x20) #x0B)
+         (let ((isr (sys.int::io-port/8 #x20)))
+           (setf (sys.int::io-port/8 #x20) #x0A)
+           (not (logbitp 7 isr))))
+        ((eql irq 15)
+         (setf (sys.int::io-port/8 #xA0) #x0B)
+         (let ((isr (sys.int::io-port/8 #xA0)))
+           (setf (sys.int::io-port/8 #xA0) #x0A)
+           (not (logbitp 7 isr))))
+        (t nil)))
 
 (defun i8259-interrupt-handler (interrupt-frame info)
   (let ((irq (- info +i8259-base-interrupt+)))
-    (dolist (handler (svref *i8259-handlers* irq))
-      (funcall handler interrupt-frame irq))
-    ;; Send EOI.
+    ;; Check if this is a spurious interrupt. These should not
+    ;; be delivered to the system and don't need an EOI.
+    ;; FIXME: This seems to have issues with IRQ15, when a secondary
+    ;; IDE controller is active.
+    #+(or)
     (with-symbol-spinlock (*i8259-spinlock*)
+      (when (i8259-irq-spurious-p irq)
+        (when (not *i8259-reported-spurious-interrupt*)
+          (setf *i8259-reported-spurious-interrupt* t)
+          (debug-print-line "Spurious i8259 IRQ " irq ". Further spurious IRQs will not be reported."))
+        (incf *i8259-spurious-interrupt-count*)
+        (return-from i8259-interrupt-handler)))
+    (irq-deliver interrupt-frame (svref *i8259-irqs* irq))
+    (with-symbol-spinlock (*i8259-spinlock*)
+      ;; Send EOI.
       (setf (sys.int::io-port/8 #x20) #x20)
       (when (>= irq 8)
         (setf (sys.int::io-port/8 #xA0) #x20)))
@@ -280,18 +301,16 @@ If clear, the fault occured in supervisor mode.")
             (setf (sys.int::io-port/8 #x21) (ldb (byte 8 0) *i8259-shadow-mask*))
             (setf (sys.int::io-port/8 #xA1) (ldb (byte 8 8) *i8259-shadow-mask*)))))))
 
-(defun i8259-hook-irq (irq handler)
-  (check-type handler (or function symbol))
-  (push-wired handler (svref *i8259-handlers* irq)))
-
 (defun initialize-i8259 ()
   ;; TODO: do the APIC & IO-APIC as well.
-  (when (not (boundp '*i8259-handlers*))
-    (setf *i8259-handlers* (sys.int::make-simple-vector 16 :wired)
+  (when (not (boundp '*i8259-irqs*))
+    (setf *i8259-irqs* (sys.int::make-simple-vector 16 :wired)
           ;; fixme: do at cold-gen time.
           *i8259-spinlock* :unlocked))
+  (setf *i8259-reported-spurious-interrupt* nil
+        *i8259-spurious-interrupt-count* 0)
   (dotimes (i 16)
-    (setf (svref *i8259-handlers* i) nil))
+    (setf (svref *i8259-irqs* i) (make-irq :platform-number i)))
   ;; Hook interrupts.
   (dotimes (i 16)
     (hook-user-interrupt (+ +i8259-base-interrupt+ i)
@@ -312,11 +331,25 @@ If clear, the fault occured in supervisor mode.")
   ;; Unmask the cascade IRQ, required for the 2nd chip to function.
   (i8259-unmask-irq 2))
 
+(defun platform-irq (number)
+  (cond ((<= 0 number 15)
+         (svref *i8259-irqs* number))
+        (t nil)))
+
+(defun all-platform-irqs ()
+  (loop
+     for i below (sys.int::%object-header-data *i8259-irqs*)
+     for irq = (svref *i8259-irqs* i)
+     collect irq))
+
+(defun map-platform-irqs (fn)
+  (loop
+     for i below (sys.int::%object-header-data *i8259-irqs*)
+     for irq = (svref *i8259-irqs* i)
+     do (funcall fn irq)))
+
 (defun platform-mask-irq (vector)
   (i8259-mask-irq vector))
 
 (defun platform-unmask-irq (vector)
   (i8259-unmask-irq vector))
-
-(defun platform-attach-irq (vector handler)
-  (i8259-hook-irq vector handler))

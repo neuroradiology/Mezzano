@@ -1,9 +1,12 @@
-;;;; Copyright (c) 2011-2016 Henry Harrington <henry.harrington@gmail.com>
-;;;; This code is licensed under the MIT license.
+;;;; The condition/error system.
 
-;;; The condition/error system.
+(in-package :mezzano.internals)
 
-(in-package :sys.int)
+(defmethod print-object ((object restart) stream)
+  (cond (*print-escape*
+         (print-unreadable-object (object stream :type t :identity t)
+           (write (restart-name object) :stream stream)))
+        (t (report-restart object stream))))
 
 (defparameter *break-on-signals* nil)
 (defparameter *active-handlers* nil)
@@ -80,7 +83,6 @@
                 :expected-type 'condition-designator))))
 
 (defun signal (datum &rest arguments)
-  (declare (dynamic-extent arguments))
   (let ((condition (coerce-to-condition 'simple-condition datum arguments)))
     (when (and *break-on-signals* (typep condition *break-on-signals*))
       (let ((*break-on-signals* nil))
@@ -90,18 +92,32 @@
       (dolist (h (first handlers))
         (when (typep condition (car h))
           (let ((*active-handlers* (rest handlers)))
-            (funcall (cdr h) condition)))))
+            (funcall (cdr h) condition))
+          ;; If a handler in this cluster declines, then no other handler
+          ;; in the cluster will be considered for possible invocation. (9.1.4)
+          (return))))
     nil))
 
+(defun %handler-bind (bindings thunk)
+  (if *active-handlers*
+      ;; There is a barrier here as this would capture the entire stack of handlers
+      ;; not just the ones inside the continuation.
+      ;; This should switch to a mechanism similar to %CATCH, but that is more
+      ;; difficult to handle because of the visibility requirements when calling
+      ;; handlers.
+      (mezzano.delimited-continuations:with-continuation-barrier ('handler-bind)
+        (let ((*active-handlers* (cons bindings *active-handlers*)))
+          (funcall thunk)))
+      (let ((*active-handlers* (cons bindings *active-handlers*)))
+        (funcall thunk))))
+
 (defmacro handler-bind (bindings &body forms)
-  `(let ((*active-handlers* (cons (list ,@(mapcar (lambda (binding)
-                                                    (destructuring-bind (type handler)
-                                                        binding
-                                                      `(cons ',type ,handler)))
-                                                  bindings))
-                                  *active-handlers*)))
-     (declare (dynamic-extent *active-handlers*))
-     (progn ,@forms)))
+  `(%handler-bind (list ,@(mapcar (lambda (binding)
+                                    (destructuring-bind (type handler)
+                                        binding
+                                      `(cons ',type ,handler)))
+                                  bindings))
+                  (lambda () (progn ,@forms))))
 
 (eval-when (:compile-toplevel :load-toplevel :execute)
 (defun compute-handler-case-forms (clauses)

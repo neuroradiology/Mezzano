@@ -1,9 +1,14 @@
-;;;; Copyright (c) 2011-2016 Henry Harrington <henry.harrington@gmail.com>
-;;;; This code is licensed under the MIT license.
+;;;; DESCRIBE and DESCRIBE-OBJECT
 
-(in-package :sys.int)
+(in-package :mezzano.internals)
 
 (defgeneric describe-object (object stream))
+
+(defmethod describe-object (object stream)
+  (format stream "~S is a ~:(~A~), with address ~X~%"
+          object
+          (type-of object)
+          (lisp-object-address object)))
 
 (defmethod describe-object ((object symbol) stream)
   (format stream "~S is a symbol, with address ~X~%" object (lisp-object-address object))
@@ -37,6 +42,10 @@
 
 (defmethod describe-object ((object float) stream)
   (etypecase object
+    (short-float
+     (format stream "~D is a half-precision floating-point number.~%" object)
+     (format stream "  It's representation is ~X.~%"
+             (%short-float-as-integer object)))
     (single-float
      (format stream "~D is a single-precision floating-point number.~%" object)
      (format stream "  It's representation is ~X.~%"
@@ -49,7 +58,14 @@
 (defmethod describe-object ((object function) stream)
   (multiple-value-bind (lambda-expression closure-p name)
       (function-lambda-expression object)
-    (format stream "~S is a ~A" object (if closure-p "closure" "function"))
+    (declare (ignore lambda-expression))
+    (format stream "~S is a ~A" object
+            (cond (closure-p "closure")
+                  ((mezzano.delimited-continuations:delimited-continuation-p object)
+                   (if (mezzano.delimited-continuations:resumable-p object)
+                       "resumable delimited continuation"
+                       "consumed delimited continuation"))
+                  (t "function")))
     (when name
       (format stream " named ~S" name))
     (format stream "~%")))
@@ -79,20 +95,23 @@
 (defmethod describe-object ((object structure-object) stream)
   (format stream "~S is a structure of type ~:(~S~), with address ~X~%"
           object (type-of object) (lisp-object-address object))
-  (let ((type (%struct-slot object 0)))
-    (loop
-       for i from 1
-       for slot in (structure-slots type) do
-         (let ((*print-level* 3)
-               (*print-length* 5))
-           (format stream "  ~S: ~S~%" (structure-slot-name slot) (%struct-slot object i))))))
-
-(defmethod describe-object ((object mezzano.supervisor:thread) stream)
-  (format stream "~S is a thread with address ~X~%"
-          object (lisp-object-address object))
-  (format stream "  It is named ~S~%" (mezzano.supervisor:thread-name object))
-  (format stream "  It is in the ~S state~%" (mezzano.supervisor:thread-state object))
-  (format stream "  It has priority ~S~%" (mezzano.supervisor:thread-priority object)))
+  (loop
+     with type = (class-of object)
+     for slot in (mezzano.clos:class-slots type)
+     for slot-name = (mezzano.clos:slot-definition-name slot)
+     for fixed-vector = (mezzano.clos:structure-slot-definition-fixed-vector slot)
+     do
+       (let ((*print-level* 3)
+             (*print-length* 5))
+         (format stream "  ~S: ~S~%"
+                 slot-name
+                 (cond (fixed-vector
+                        (let ((vec (make-array fixed-vector)))
+                          (dotimes (i fixed-vector)
+                            (setf (aref vec i) (%struct-vector-slot object type slot-name i)))
+                          vec))
+                       (t
+                        (%struct-slot object type slot-name)))))))
 
 (defmethod describe-object ((object function-reference) stream)
   (format stream "~S is a function reference named ~S, with address ~X~%"
@@ -105,11 +124,16 @@
 (defmethod describe-object ((object weak-pointer) stream)
   (format stream "~S is a weak pointer, with address ~X~%"
           object (lisp-object-address object))
-  (multiple-value-bind (value livep)
-      (weak-pointer-value object)
-    (if livep
-        (format stream "  It points to the live value ~S.~%" value)
-        (format stream "  It is dead.~%"))))
+  (format stream "  It has weakness ~:(~S~)~%"
+          (weak-pointer-weakness object))
+  (multiple-value-bind (key value livep)
+      (weak-pointer-pair object)
+    (cond ((not livep)
+           (format stream "  It is dead.~%"))
+          ((eql key value)
+           (format stream "  It points to the live value ~S.~%" value))
+          (t
+           (format stream "  It has the key ~S and points to the live value ~S.~%" key value)))))
 
 (defmethod describe-object ((object integer) stream)
   (cond ((fixnump object)
@@ -128,17 +152,28 @@
 
 (defmethod describe-object ((object standard-object) stream)
   (format stream "A Closette object~%~
-             Printed representation: ~S~%~
+             Printed representation: ~A~%~
              Class: ~S~%~
              Structure~%"
-          object
+          (handler-case
+              (format nil "~S" object)
+            (error ()
+              (with-output-to-string (s)
+                (print-unreadable-object (object s :type t :identity t)
+                  (format s "<<error printing object>>")))))
           (class-of object))
   (dolist (sn (mapcar #'mezzano.clos:slot-definition-name
                       (mezzano.clos:class-slots (class-of object))))
     (if (slot-boundp object sn)
-        (format stream "    ~S <- ~S~%"
+        (format stream "    ~S <- ~A~%"
                 sn
-                (slot-value object sn))
+                (let ((value (slot-value object sn)))
+                  (handler-case
+                      (format nil "~S" value)
+                    (error ()
+                      (with-output-to-string (s)
+                        (print-unreadable-object (value s :type t :identity t)
+                          (format s "<<error printing object>>")))))))
         (format stream "    ~S <- not bound~%" sn))))
 
 (defun describe (object &optional stream)

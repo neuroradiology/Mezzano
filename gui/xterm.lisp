@@ -1,10 +1,8 @@
-;;;; Copyright (c) 2011-2016 Henry Harrington <henry.harrington@gmail.com>
-;;;; This code is licensed under the MIT license.
-
 ;;;; An XTerm emulator widget.
 
 (defpackage :mezzano.gui.xterm
   (:use :cl)
+  (:local-nicknames (:theme :mezzano.gui.theme))
   (:export #:xterm-terminal
            #:xterm-resize
            #:terminal-width
@@ -47,9 +45,7 @@
    (scroll-end :initarg :scroll-end :accessor scroll-end)
 
    (autowrap :initarg :autowrap :accessor autowrap) ; DECAWM (7)
-   )
-  (:default-initargs
-   :queued-bytes '()))
+   ))
 
 (defvar *xterm-translations*
   '((#\Up-Arrow    (#\Esc #\[ #\A))
@@ -80,13 +76,13 @@
   "Translate a character into a form suitable for consumption by a terminal client.
 Calls FN with each output character."
   (declare (ignore terminal))
-  (cond ((or (sys.int::char-bit character :meta)
-             (sys.int::char-bit character :super)
-             (sys.int::char-bit character :hyper))
+  (cond ((or (mezzano.internals::char-bit character :meta)
+             (mezzano.internals::char-bit character :super)
+             (mezzano.internals::char-bit character :hyper))
          ;; Ignore weird characters.
          ;; FIXME: Do stuff with META.
          )
-        ((sys.int::char-bit character :control)
+        ((mezzano.internals::char-bit character :control)
          ;; Control character. Translate to C0 control set or ignore.
          ;; Wonder how to type the C1 control characters...
          (when (<= #x3F (char-code (char-upcase character)) #x5F)
@@ -148,7 +144,7 @@ Calls FN with each output character."
     colours))
 
 (defparameter *xterm-colours* (generate-xterm-colour-table))
-(defparameter *xterm-default-background-colour* (mezzano.gui:make-colour 0 0 0 0.85)
+(defparameter *xterm-default-background-colour* theme:*xterm-background*
   "Use this colour for the background when no background colour has been specified.")
 
 (defparameter *dec-special-characters-and-line-drawing*
@@ -212,7 +208,7 @@ Calls FN with each output character."
            (ldb (byte 8 0) colour))) ; Blue
         *xterm-default-background-colour*)))
 
-(defmethod initialize-instance :after ((term xterm-terminal) &key width height font &allow-other-keys)
+(defmethod initialize-instance :after ((term xterm-terminal) &key width height)
   (let* ((fb (terminal-framebuffer term)))
     (setf (slot-value term 'width) (truncate width (cell-pixel-width term))
           (slot-value term 'height) (truncate height (cell-pixel-height term)))
@@ -487,6 +483,7 @@ Calls FN with each output character."
 
 (defun adjust-ansi-mode (terminal mode value)
   "Set an ANSI mode. '<Esc>[Pn;Pm...h' or '<Esc>[Pn;Pm...l'"
+  (declare (ignore terminal value))
   (case mode
     (t (format t "Unsupported ANSI mode ~D.~%" mode))))
 

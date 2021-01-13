@@ -1,8 +1,8 @@
-;;;; Copyright (c) 2011-2016 Henry Harrington <henry.harrington@gmail.com>
-;;;; This code is licensed under the MIT license.
+;;;; File manger
 
 (defpackage :mezzano.gui.filer
   (:use :cl)
+  (:local-nicknames (:font :mezzano.gui.font))
   (:export #:spawn))
 
 (in-package :mezzano.gui.filer)
@@ -11,18 +11,16 @@
 (defvar *file-icon* (mezzano.gui.image:load-image "LOCAL:>Icons>16x16 File.png"))
 (defvar *folder-icon* (mezzano.gui.image:load-image "LOCAL:>Icons>16x16 Folder.png"))
 
-(defvar *directory-colour* mezzano.gui:*default-foreground-colour*)
-
 (defun colourise-path (path)
   (case (canonical-type-from-pathname-type (pathname-type path))
-    (:lisp-source-code (mezzano.gui:make-colour-from-octets #x94 #xBF #xF3))
-    (:compiled-lisp-code (mezzano.gui:make-colour-from-octets #xF0 #xAF #x8F))
-    (:text (mezzano.gui:make-colour-from-octets #xCC #x93 #x93))
-    (:font (mezzano.gui:make-colour-from-octets #x7F #x9F #x7F))
-    (:image (mezzano.gui:make-colour-from-octets #xDC #x8C #xC3))
-    (:video (mezzano.gui:make-colour-from-octets #xDC #x8C #xC3))
-    (:audio (mezzano.gui:make-colour-from-octets #xDC #x8C #xC3))
-    (t mezzano.gui:*default-foreground-colour*)))
+    (:lisp-source-code mezzano.gui.theme:*filer-lisp-source-code*)
+    (:compiled-lisp-code mezzano.gui.theme:*filer-compiled-lisp-code*)
+    (:text mezzano.gui.theme:*filer-text*)
+    (:font mezzano.gui.theme:*filer-font*)
+    (:image mezzano.gui.theme:*filer-media*)
+    (:video mezzano.gui.theme:*filer-media*)
+    (:audio mezzano.gui.theme:*filer-media*)
+    (t mezzano.gui.theme:*foreground*)))
 
 (defclass filer ()
   ((%fifo :initarg :fifo :reader fifo)
@@ -34,7 +32,8 @@
    (%clickables :initarg :clickables :accessor clickables))
   (:default-initargs :clickables '()))
 
-(defgeneric dispatch-event (viewer event))
+(defgeneric dispatch-event (viewer event)
+  (:method (viewer event) nil))
 
 (defmethod dispatch-event (window (event mezzano.gui.compositor:window-activation-event))
   (setf (mezzano.gui.widgets:activep (frame window)) (mezzano.gui.compositor:state event))
@@ -43,7 +42,7 @@
 (defvar *type-registry*
   '((:lisp-source-code "lisp" "lsp" "asd" "lisp-expr")
     (:compiled-lisp-code "llf")
-    (:text "text" "txt" "html" "css" "texinfo" "tex" "sh" "markdown" "md" "el")
+    (:text "text" "txt" "html" "css" "texinfo" "tex" "sh" "markdown" "md" "el" "cfg")
     (:font "ttf")
     (:image "png" "jpeg" "jpg")
     (:video "avi" "gif")
@@ -65,13 +64,7 @@
     (error "No way to view files of type ~A." type)))
 
 (defun view-in-editor (path)
-  ;; Ech, the terrible groveling.
-  (let ((existing (mezzano.gui.compositor:get-window-by-kind :editor)))
-    (cond (existing
-           (mezzano.supervisor:fifo-push (make-instance (read-from-string "med:open-file-request") :path path)
-                                           (mezzano.gui.compositor::fifo existing)
-                                           nil))
-          (t (funcall (read-from-string "med:spawn") :initial-file path)))))
+  (ed path))
 
 (defmethod view ((type (eql :lisp-source-code)) path)
   (view-in-editor path))
@@ -134,30 +127,9 @@
 (defmethod dispatch-event (app (event mezzano.gui.compositor:resize-event))
   (change-path app (path app)))
 
-(defun draw-string (string font framebuffer x y colour)
-  (loop
-     with pen = x
-     for ch across string
-     for glyph = (mezzano.gui.font:character-to-glyph font ch)
-     for mask = (mezzano.gui.font:glyph-mask glyph)
-     do
-       (mezzano.gui:bitset :blend
-                           (mezzano.gui:surface-width mask) (mezzano.gui:surface-height mask)
-                           colour
-                           framebuffer
-                           (+ pen (mezzano.gui.font:glyph-xoff glyph))
-                           (- y (mezzano.gui.font:glyph-yoff glyph))
-                           mask 0 0)
-       (incf pen (mezzano.gui.font:glyph-advance glyph))
-     finally (return pen)))
-
 (defun change-path (viewer new-path)
   (setf (path viewer) new-path
-        ;; Grumble
-        (mezzano.gui.widgets:frame-title (frame viewer)) (concatenate 'string
-                                                                      (string (mezzano.file-system:host-name (pathname-host new-path)))
-                                                                      ":"
-                                                                      (mezzano.file-system:unparse-pathname new-path (pathname-host new-path))))
+        (mezzano.gui.widgets:frame-title (frame viewer)) (namestring new-path))
   (let* ((window (window viewer))
          (framebuffer (mezzano.gui.compositor:window-buffer window))
          (font (font viewer))
@@ -165,6 +137,7 @@
          (height (mezzano.gui.compositor:height window))
          (stuff (directory (make-pathname :name :wild
                                           :type :wild
+                                          :device :wild
                                           :defaults new-path)))
          (files (sort (remove-if-not (lambda (x) (pathname-name x)) stuff)
                       #'string-lessp
@@ -177,7 +150,7 @@
       (mezzano.gui:bitset :set
                           (- width left right)
                           (- height top bottom)
-                          mezzano.gui:*default-background-colour*
+                          mezzano.gui.theme:*background*
                           framebuffer
                           left top)
       (let ((y top)
@@ -185,16 +158,17 @@
             (next-left-margin 0)
             (column-y))
         (flet ((wr (string &optional (offset 0) (min-line-height 0))
-                 (draw-string string
-                              font
-                              framebuffer
-                              (+ left offset) (+ y (mezzano.gui.font:ascender font))
-                              mezzano.gui:*default-foreground-colour*)
+                 (font:draw-string
+                  string
+                  font
+                  framebuffer
+                  (+ left offset) (+ y (mezzano.gui.font:ascender font))
+                  mezzano.gui.theme:*foreground*)
                  (incf y (max min-line-height (mezzano.gui.font:line-height font))))
-               (seperator ()
+               (separator ()
                  (mezzano.gui:bitset :set
                                      (- width left right) 1
-                                     mezzano.gui:*default-foreground-colour*
+                                     mezzano.gui.theme:*foreground*
                                      framebuffer
                                      left y)
                  (incf y))
@@ -204,11 +178,12 @@
                                      icon 0 0
                                      framebuffer
                                      (1+ left-margin) y)
-                 (let ((end (draw-string name
-                                         font
-                                         framebuffer
-                                         (+ left-margin 16 2) (+ y 2 (mezzano.gui.font:ascender font))
-                                         colour)))
+                 (let ((end (font:draw-string
+                             name
+                             font
+                             framebuffer
+                             (+ left-margin 16 2) (+ y 2 (mezzano.gui.font:ascender font))
+                             colour)))
                    (setf next-left-margin (max next-left-margin end))
                    (push (list left-margin y end (+ y (max 16 (mezzano.gui.font:line-height font)))
                                thing)
@@ -227,27 +202,27 @@
               (let ((before pen))
                 (incf pen 10)
                 (cond ((eql host (pathname-host new-path))
-                       (let ((text-width (draw-string (mezzano.file-system:host-name host)
-                                                      font
-                                                      framebuffer
-                                                      0 0
-                                                      #x00000000)))
+                       (let ((text-width (font:string-display-width
+                                          (mezzano.file-system:host-name host)
+                                          font)))
                          (mezzano.gui:bitset :set
                                              (+ 10 text-width 10)
                                              (mezzano.gui.font:line-height font)
-                                             mezzano.gui:*default-foreground-colour*
+                                             mezzano.gui.theme:*foreground*
                                              framebuffer
                                              (- pen 10) y)
-                         (setf pen (draw-string (mezzano.file-system:host-name host)
-                                                font
-                                                framebuffer
-                                                pen (+ y (mezzano.gui.font:ascender font))
-                                                mezzano.gui:*default-background-colour*))))
-                      (t (setf pen (draw-string (mezzano.file-system:host-name host)
-                                                font
-                                                framebuffer
-                                                pen (+ y (mezzano.gui.font:ascender font))
-                                                mezzano.gui:*default-foreground-colour*))))
+                         (setf pen (font:draw-string
+                                    (mezzano.file-system:host-name host)
+                                    font
+                                    framebuffer
+                                    pen (+ y (mezzano.gui.font:ascender font))
+                                    mezzano.gui.theme:*background*))))
+                      (t (setf pen (font:draw-string
+                                    (mezzano.file-system:host-name host)
+                                    font
+                                    framebuffer
+                                    pen (+ y (mezzano.gui.font:ascender font))
+                                    mezzano.gui.theme:*foreground*))))
                 (incf pen 10)
                 (push (list before y pen (+ y (mezzano.gui.font:line-height font))
                             (make-pathname :host host
@@ -257,21 +232,21 @@
                                            :version :newest))
                       (clickables viewer))))
             (incf y (mezzano.gui.font:line-height font)))
-          (seperator)
+          (separator)
           (wr (namestring new-path))
-          (seperator)
+          (separator)
           (setf column-y y)
           (when (not (= (length (pathname-directory new-path)) 1))
             (clickable *up-icon*
                        "Parent"
                        (make-pathname :directory (butlast (pathname-directory new-path))
                                       :defaults new-path)
-                       mezzano.gui:*default-foreground-colour*))
+                       mezzano.gui.theme:*foreground*))
           (dolist (d dirs)
             (clickable *folder-icon*
                        (format nil "~A" (first (last (pathname-directory d))))
                        d
-                       *directory-colour*))
+                       mezzano.gui.theme:*foreground*))
           (dolist (f files)
             (clickable *file-icon*
                        (file-namestring f)
@@ -304,6 +279,7 @@
                                      :font font
                                      :frame frame
                                      :path default-path)))
+          (setf (mezzano.gui.compositor:name window) filer)
           (change-path filer default-path)
           (loop
              (handler-case

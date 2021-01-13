@@ -1,9 +1,30 @@
-;;;; Copyright (c) 2011-2016 Henry Harrington <henry.harrington@gmail.com>
-;;;; This code is licensed under the MIT license.
-
 ;;;; Support functions for cross-compilation.
 
-(in-package :sys.c)
+(in-package :cross-support)
+
+(defmacro mezzano.extensions:cas (place old new)
+  ;; As a special cross-build exception, support hash-tables.
+  (cond ((and (consp place)
+              (eql (first place) 'gethash))
+         (destructuring-bind (key hash-table &optional default)
+             (rest place)
+           `(cas-hash-table ,key ,hash-table ,default ,old ,new)))
+        (t
+         `(error "Cross-cas ~S not supported" place))))
+
+(defun sys.int::%defun (name lambda &optional documentation)
+  (declare (ignore documentation))
+  ;; Completely ignore CAS functions when cross compiling, they're not needed.
+  (unless (and (consp name) (eql (first name) 'mezzano.extensions:cas))
+    (setf (fdefinition name) lambda))
+  name)
+
+(defun fboundp (name)
+  (if (and (consp name) (eql (first name) 'mezzano.extensions:cas))
+      nil
+      (cl:fboundp name)))
+
+(in-package :mezzano.compiler)
 
 (define-condition sys.int::simple-style-warning (style-warning simple-condition) ())
 
@@ -11,38 +32,118 @@
 
 (defvar *target-architecture*)
 
-(defvar *system-macros* (make-hash-table :test 'eq))
-(defvar *system-compiler-macros* (make-hash-table :test 'equal))
-(defvar *system-symbol-macros* (make-hash-table :test 'eq))
-(defvar *system-symbol-declarations* (make-hash-table :test 'eq))
+(in-package :mezzano.internals)
 
-(defstruct (structure-type
-             (:constructor sys.int::make-struct-type
-                           (name slots parent area)))
-  (name)
-  (slots)
-  (parent)
-  (area))
+(defclass structure-definition ()
+  ((name :initarg :name :reader structure-definition-name)
+   (slots :initarg :slots :reader structure-definition-slots)
+   (parent :initarg :parent :reader structure-definition-parent)
+   (area :initarg :area :reader structure-definition-area)
+   (size :initarg :size :reader structure-definition-size)
+   (layout :initarg :layout :accessor structure-definition-layout)
+   (sealed :initarg :sealed :reader structure-definition-sealed)
+   (docstring :initarg :docstring :reader structure-definition-docstring)
+   (has-standard-constructor :initarg :has-standard-constructor :reader structure-definition-has-standard-constructor)))
 
-(defun sys.int::make-struct-definition (&rest blah)
-  (apply #'sys.int::make-struct-type blah))
+(defun sys.int::%make-struct-definition (name slots parent area size layout sealed docstring has-standard-constructor)
+  (make-instance 'structure-definition
+                 :name name
+                 :slots slots
+                 :parent parent
+                 :area area
+                 :size size
+                 :layout layout
+                 :sealed sealed
+                 :docstring docstring
+                 :has-standard-constructor has-standard-constructor))
 
-(defstruct (structure-slot
-             (:constructor sys.int::make-struct-slot-definition
-                           (name accessor initform type read-only)))
-  name
-  accessor
-  initform
-  type
-  read-only)
+(defun sys.int::structure-definition-p (object)
+  (typep object 'structure-definition))
 
-(defun sys.int::structure-slot-name (x) (structure-slot-name x))
-(defun sys.int::structure-slot-accessor (x) (structure-slot-accessor x))
-(defun sys.int::structure-slot-initform (x) (structure-slot-initform x))
-(defun sys.int::structure-slot-type (x) (structure-slot-type x))
-(defun sys.int::structure-slot-read-only (x) (structure-slot-read-only x))
+(defun mezzano.clos:class-precedence-list (class)
+  ;; Materialize slightly-broken precedence lists for structure definitions too.
+  (if (typep class 'structure-definition)
+      (if (structure-definition-parent class)
+          (list* class (mezzano.clos:class-precedence-list (structure-definition-parent class)))
+          (list class))
+      (c2mop:class-precedence-list class)))
 
-(defvar *structure-types* (make-hash-table :test 'eq))
+(defun mezzano.clos::safe-class-precedence-list (class)
+  (mezzano.clos:class-precedence-list class))
+
+(defstruct layout
+  class
+  obsolete
+  heap-size
+  heap-layout
+  area
+  instance-slots)
+
+(defun make-struct-definition (name slots parent area size layout sealed docstring has-standard-constructor)
+  (let* ((def (sys.int::%make-struct-definition name slots parent area size nil sealed docstring has-standard-constructor))
+         (layout-object (make-layout
+                         :class def
+                         :obsolete nil
+                         :heap-size size
+                         :heap-layout layout
+                         :area area
+                         ;; ### Not currently supported for structs.
+                         :instance-slots nil)))
+    (setf (structure-definition-layout def) layout-object)
+    def))
+
+(defclass structure-slot-definition ()
+  ((name :initarg :name :reader structure-slot-definition-name)
+   (accessor :initarg :accessor :reader structure-slot-definition-accessor)
+   (initform :initarg :initform :reader structure-slot-definition-initform)
+   (type :initarg :type :reader structure-slot-definition-type)
+   (read-only :initarg :read-only :reader structure-slot-definition-read-only :reader mezzano.clos:structure-slot-definition-read-only)
+   (location :initarg :location :reader structure-slot-definition-location)
+   (fixed-vector :initarg :fixed-vector :reader structure-slot-definition-fixed-vector)
+   (align :initarg :align :reader structure-slot-definition-align)
+   (dcas-sibling :initarg :dcas-sibling :reader structure-slot-definition-dcas-sibling :reader mezzano.clos:structure-slot-definition-dcas-sibling)
+   (documentation :initarg :documentation :reader structure-slot-definition-documentation)))
+
+(defun sys.int::make-struct-slot-definition (name accessor initform type read-only location fixed-vector align dcas-sibling documentation)
+  (make-instance 'structure-slot-definition
+                 :name name
+                 :accessor accessor
+                 :initform initform
+                 :type type
+                 :read-only read-only
+                 :location location
+                 :fixed-vector fixed-vector
+                 :align align
+                 :dcas-sibling dcas-sibling
+                 :documentation documentation))
+
+(defmethod print-object ((object structure-slot-definition) stream)
+  (print-unreadable-object (object stream :type t :identity t)
+    (format stream "~S"
+            (list :name (structure-slot-definition-name object)
+                  :accessor (structure-slot-definition-accessor object)
+                  :initform (structure-slot-definition-initform object)
+                  :type (structure-slot-definition-type object)
+                  :read-only (structure-slot-definition-read-only object)
+                  :location (structure-slot-definition-location object)
+                  :fixed-vector (structure-slot-definition-fixed-vector object)
+                  :align (structure-slot-definition-align object)
+                  :dcas-sibling (structure-slot-definition-dcas-sibling object)
+                  :documentation (structure-slot-definition-documentation object)))))
+
+(defstruct (instance-header
+             (:constructor mezzano.compiler::%%make-instance-header
+                           (layout)))
+  layout)
+
+(in-package :mezzano.compiler)
+
+(defun mezzano.runtime::%make-instance-header (layout)
+  (assert (not (eql layout t)))
+  (%%make-instance-header layout))
+
+(defun mezzano.runtime::%unpack-instance-header (header)
+  (sys.int::instance-header-layout header))
 
 (defun ldb (bytespec integer)
   (logand (ash integer (- (byte-position bytespec)))
@@ -185,6 +286,8 @@
     (#x104027 "Right-Super")
     (#x104028 "Left-Hyper")
     (#x104029 "Right-Hyper")
+    (#x10402A "Scroll-Lock" "Scrolllock")
+    (#x10402B "Num-Lock" "Numlock")
     (#x1040F0 "KP-0")
     (#x1040F1 "KP-1")
     (#x1040F2 "KP-2")
@@ -225,108 +328,15 @@
     (#x1040A0 "WWW-Refresh")
     (#x1040A1 "WWW-Favorites")))
 
-(defun character-reader (stream ch p)
-  (declare (ignore ch p))
-  (let ((x (read-char stream t nil t))
-        (y (peek-char nil stream nil nil t)))
-    (if (or (eql nil y)
-            (get-macro-character y)
-            (member y '(#\Space #\Tab #\Newline) :test #'char-equal))
-        ;; Simple form: Single character followed by EOF or a non-constituent character.
-        ;; Just return the character that was read.
-        x
-        ;; Reading a character name, similar to read-token, but no special handling
-        ;; is done for packages or numbers.
-        (let ((token (make-array 1
-                                 :element-type 'character
-                                 :initial-element x
-                                 :adjustable t
-                                 :fill-pointer t)))
-          (do ((z (read-char stream nil nil t)
-                  (read-char stream nil nil t)))
-              ((or (eql nil z)
-                   (when (or (get-macro-character z)
-                             (member z '(#\Space #\Tab #\Newline) :test #'char-equal))
-                     (unread-char z stream)
-                     t)))
-            (vector-push-extend z token))
-          ;; Finished reading the token, convert it to a character
-          (let ((c (cross-name-char token)))
-            (when (and (not c) (not *read-suppress*))
-              (error 'simple-reader-error :stream stream
-                     :format-control "Unrecognized character name ~S."
-                     :format-arguments (list token)))
-            c)))))
-
-(defun cross-name-char (name)
+(defun name-char (name)
   (or (loop for (code . names) in *char-name-alist*
          when (member name names :test #'string-equal)
          do (return (code-char code)))
-      (name-char name)))
-
-(defvar *cross-readtable* (copy-readtable nil))
-(set-dispatch-macro-character #\# #\\ 'character-reader *cross-readtable*)
-
-(defun read-backquote (stream first)
-  (declare (ignore first))
-  (list 'sys.int::backquote (read stream t nil t)))
-
-(defun read-comma (stream first)
-  (declare (ignore first))
-  (case (peek-char nil stream t)
-    (#\@ (read-char stream t nil t)
-         (list 'sys.int::bq-comma-atsign (read stream t nil t)))
-    (#\. (read-char stream t nil t)
-         (list 'sys.int::bq-comma-dot (read stream t nil t)))
-    (otherwise
-     (list 'sys.int::bq-comma (read stream t nil t)))))
-
-(set-macro-character #\` 'read-backquote nil *cross-readtable*)
-(set-macro-character #\, 'read-comma nil *cross-readtable*)
-
-(defun eval-feature-test (test)
-  "Evaluate the feature expression TEST."
-  (etypecase test
-    (symbol (member test sys.int::*features*))
-    (cons (case (car test)
-            (:not (when (or (null (cdr test)) (cddr test))
-                    (error "Invalid feature expression ~S" test))
-                  (not (eval-feature-test (cadr test))))
-            (:and (dolist (subexpr (cdr test) t)
-                    (when (not (eval-feature-test subexpr))
-                      (return nil))))
-            (:or (dolist (subexpr (cdr test) nil)
-                   (when (eval-feature-test subexpr)
-                     (return t))))
-            (t (error "Invalid feature expression ~S" test))))))
-
-(defun read-features (stream suppress-if-false)
-  "Common function to implement #+ and #-."
-  (let* ((test (let ((*package* (find-package "KEYWORD")))
-                 (read stream t nil t)))
-         (*read-suppress* (or *read-suppress*
-                              (if suppress-if-false
-                                  (not (eval-feature-test test))
-                                  (eval-feature-test test))))
-         (value (read stream t nil t)))
-    (if *read-suppress*
-        (values)
-        value)))
-
-(defun read-feature-plus (stream ch p)
-  (declare (ignore ch p))
-  (read-features stream t))
-
-(defun read-feature-minus (stream ch p)
-  (declare (ignore ch p))
-  (read-features stream nil))
-
-(set-dispatch-macro-character #\# #\+ 'read-feature-plus *cross-readtable*)
-(set-dispatch-macro-character #\# #\- 'read-feature-minus *cross-readtable*)
+      (cl:name-char name)))
 
 (defmethod lookup-variable-in-environment (symbol (environment null))
   (multiple-value-bind (expansion expandedp)
-      (gethash symbol *system-symbol-macros*)
+      (gethash symbol cross-support::*system-symbol-macros*)
     (if expandedp
         (make-instance 'symbol-macro :name symbol :expansion expansion)
         (make-instance 'special-variable
@@ -349,10 +359,10 @@
   nil)
 
 (defmethod compiler-macro-function-in-environment (name (environment null))
-  (gethash name *system-compiler-macros*))
+  (gethash name cross-support::*system-compiler-macros*))
 
 (defmethod macro-function-in-environment (symbol (environment null))
-  (gethash symbol *system-macros*))
+  (gethash symbol cross-support::*system-macros*))
 
 (defmethod lookup-variable-declared-type-in-environment (symbol (environment null))
   (mezzano.runtime::symbol-type symbol))
@@ -360,12 +370,16 @@
 (defmethod optimize-qualities-in-environment ((environment null))
   '())
 
+(defun sys.int::%define-compiler-macro (name function)
+  (setf (compiler-macro-function name) function)
+  name)
+
 (defun compiler-macro-function (name &optional env)
   (compiler-macro-function-in-environment name env))
 
 (defun (setf compiler-macro-function) (value name &optional env)
   (assert (eql env nil))
-  (setf (gethash name *system-compiler-macros*) value))
+  (setf (gethash name cross-support::*system-compiler-macros*) value))
 
 (defun macro-function (symbol &optional env)
   (macro-function-in-environment symbol env))
@@ -393,37 +407,6 @@
                (values form nil))))
         (t (values form nil))))
 
-(defun remove-&environment (orig-lambda-list)
-  (do* ((lambda-list (copy-list orig-lambda-list))
-        (prev nil i)
-        (i lambda-list (cdr i)))
-       ((null i) (values lambda-list nil))
-    (when (eql (first i) '&environment)
-      (assert (not (null (cdr i))) ()
-              "Missing variable after &ENVIRONMENT.")
-      (if prev
-          (setf (cdr prev) (cddr i))
-          (setf lambda-list (cddr i)))
-      (assert (not (member '&environment lambda-list)) ()
-              "Duplicate &ENVIRONMENT variable in lambda-list ~S." orig-lambda-list)
-      (return (values lambda-list (second i))))))
-
-(defmacro def-x-macro (name lambda-list &body body)
-  (let ((whole))
-    (multiple-value-bind (fixed-lambda-list env)
-        (remove-&environment lambda-list)
-      (when (null env)
-        (setf env (gensym)))
-      (if (eql (first fixed-lambda-list) '&whole)
-          (setf whole (second fixed-lambda-list)
-                fixed-lambda-list (cddr fixed-lambda-list))
-          (setf whole (gensym)))
-      `(setf (gethash ',name *system-macros*)
-             (lambda (,whole ,env)
-               (declare (ignorable ,whole ,env))
-               (destructuring-bind ,fixed-lambda-list (cdr ,whole)
-                 (block ,name ,@body)))))))
-
 (defvar *macroexpand-hook* 'funcall)
 
 (defun constantp (form &optional env)
@@ -439,7 +422,8 @@
              (keywordp symbol)
              (cl:constantp symbol))
          :constant)
-        (t (gethash symbol *system-symbol-declarations*))))
+        (t
+         (values (gethash symbol cross-support::*system-symbol-declarations*)))))
 
 (defvar *output-fasl*)
 (defvar *output-map*)
@@ -453,7 +437,7 @@
 (defun x-compile-top-level-lms-body (forms env mode)
   "Common code for handling the body of LOCALLY, MACROLET and SYMBOL-MACROLET forms at the top-level."
   (multiple-value-bind (body declares)
-      (parse-declares forms)
+      (sys.int::parse-declares forms)
     (x-compile-top-level-implicit-progn
      body (extend-environment env :declarations declares) mode)))
 
@@ -525,11 +509,12 @@
                          (and (not compile) (not load) (not eval)))
                      nil)
                     (t (error "Impossible!"))))))
-             ;; 6. Otherwise, the form is a top level form that is not one of the
-             ;;    special cases. In compile-time-too mode, the compiler first
-             ;;    evaluates the form in the evaluation environment and then minimally
-             ;;    compiles it. In not-compile-time mode, the form is simply minimally
-             ;;    compiled. All subforms are treated as non-top-level forms.
+             ;; 6. Otherwise, the form is a top level form that is not one
+             ;;    of the special cases. In compile-time-too mode, the compiler
+             ;;    first evaluates the form in the evaluation environment
+             ;;    and then minimally compiles it. In not-compile-time mode,
+             ;;    the form is simply minimally compiled. All subforms are
+             ;;    treated as non-top-level forms.
              (t (when (eql mode :compile-time-too)
                   (x-eval expansion env))
                 (when *output-fasl*
@@ -556,39 +541,41 @@
 (defstruct (cross-fref (:constructor make-cross-fref (name)))
   name)
 
-;; Should be a weak hash table.
+;; FIXME: Should be a weak hash table. How to deal with setf/cas names?
 (defvar *fref-table* (make-hash-table :test #'equal))
 
 (defun resolve-fref (name)
   (alexandria:ensure-gethash name *fref-table*
                              (make-cross-fref name)))
 
+(defun sys.int::function-reference (name)
+  (resolve-fref name))
+
+(defvar *symbol-global-value-cell-table* (make-hash-table :test #'equal :weakness :key))
+
+(defstruct (cross-symbol-global-value-cell
+             (:constructor make-cross-symbol-global-value-cell (name)))
+  name)
+
+(defun mezzano.runtime::symbol-global-value-cell (symbol)
+  (alexandria:ensure-gethash symbol *symbol-global-value-cell-table*
+                             (make-cross-symbol-global-value-cell symbol)))
+
 (defun sys.int::assemble-lap (code &optional name debug-info wired architecture)
   (declare (ignore wired))
   (multiple-value-bind (mc constants fixups symbols gc-data)
-      (let ((sys.lap:*function-reference-resolver* #'resolve-fref))
-        (declare (special sys.lap:*function-reference-resolver*)) ; blech.
-        (ecase architecture
-          (:x86-64
-           (sys.lap-x86:assemble code
-             :base-address 16
-             :initial-symbols '((nil . :fixup)
-                                (t . :fixup)
-                                (:unbound-value . :fixup)
-                                (:undefined-function . :fixup)
-                                (:closure-trampoline . :fixup)
-                                (:funcallable-instance-trampoline . :fixup))
-             :info (list name debug-info)))
-          (:arm64
-           (mezzano.lap.arm64:assemble code
-             :base-address 16
-             :initial-symbols '((nil . :fixup)
-                                (t . :fixup)
-                                (:unbound-value . :fixup)
-                                (:undefined-function . :fixup)
-                                (:closure-trampoline . :fixup)
-                                (:funcallable-instance-trampoline . :fixup))
-             :info (list name debug-info)))))
+      (let ((mezzano.lap:*function-reference-resolver* #'resolve-fref))
+        (declare (special mezzano.lap:*function-reference-resolver*)) ; blech.
+        (mezzano.lap:perform-assembly-using-target
+         (canonicalize-target architecture)
+         code
+         :base-address 16
+         :initial-symbols '((nil . :fixup)
+                            (t . :fixup)
+                            (:unbound-value . :fixup)
+                            (:symbol-binding-cache-sentinel . :fixup)
+                            (:layout-instance-header . :fixup))
+         :info (list name debug-info)))
     (declare (ignore symbols))
     (make-cross-function :mc mc
                          :constants constants
@@ -645,9 +632,17 @@
 
 (defgeneric save-one-object (object object-map stream))
 
+(defmethod save-one-object ((object sys.int::instance-header) omap stream)
+  (save-object (sys.int::layout-class (mezzano.runtime::%unpack-instance-header object)) omap stream)
+  (write-byte sys.int::+llf-instance-header+ stream))
+
 (defmethod save-one-object ((object cross-fref) omap stream)
   (save-object (cross-fref-name object) omap stream)
   (write-byte sys.int::+llf-function-reference+ stream))
+
+(defmethod save-one-object ((object cross-symbol-global-value-cell) omap stream)
+  (save-object (cross-symbol-global-value-cell-name object) omap stream)
+  (write-byte sys.int::+llf-symbol-global-value-cell+ stream))
 
 (defmethod save-one-object ((object cross-function) omap stream)
   (let ((constants (cross-function-constants object)))
@@ -686,16 +681,9 @@
            (save-integer (length (package-name package)) stream)
            (dotimes (i (length (package-name package)))
              (save-character (char (package-name package) i) stream))))
-        (t (save-object (symbol-name object) omap stream)
-           ;; Should save flags?
-           (if (boundp object)
-               (save-object (symbol-value object) omap stream)
-               (write-byte sys.int::+llf-unbound+ stream))
-           (if (fboundp object)
-               (save-object (symbol-function object) omap stream)
-               (write-byte sys.int::+llf-unbound+ stream))
-           (save-object (symbol-plist object) omap stream)
-           (write-byte sys.int::+llf-uninterned-symbol+ stream))))
+        (t
+         (save-object (symbol-name object) omap stream)
+         (write-byte sys.int::+llf-uninterned-symbol+ stream))))
 
 (defmethod save-one-object ((object string) omap stream)
   (write-byte sys.int::+llf-string+ stream)
@@ -713,49 +701,95 @@
          (save-integer (length object) stream)
          (dotimes (i (length object))
            (save-integer (aref object i) stream)))
-        (t (dotimes (i (length object))
-             (save-object (aref object i) omap stream))
-           (write-byte sys.int::+llf-simple-vector+ stream)
-           (save-integer (length object) stream))))
+        (t
+         (write-byte sys.int::+llf-simple-vector+ stream)
+         (save-integer (length object) stream)
+         (dotimes (i (length object))
+           (save-object (aref object i) omap stream))
+         (write-byte sys.int::+llf-initialize-array+ stream)
+         (save-integer (length object) stream))))
 
 (defmethod save-one-object ((object character) omap stream)
   (write-byte sys.int::+llf-character+ stream)
   (save-character object stream))
 
-(defmethod save-one-object ((object structure-type) omap stream)
-  (save-object (structure-type-name object) omap stream)
-  (save-object (structure-type-slots object) omap stream)
-  (save-object (structure-type-parent object) omap stream)
-  (save-object (structure-type-area object) omap stream)
+(defmethod save-one-object ((object sys.int::structure-definition) omap stream)
+  (save-object (sys.int::structure-definition-name object) omap stream)
+  (save-object (sys.int::structure-definition-slots object) omap stream)
+  (save-object (sys.int::structure-definition-parent object) omap stream)
+  (save-object (sys.int::structure-definition-area object) omap stream)
+  (save-object (sys.int::structure-definition-size object) omap stream)
+  (save-object (sys.int::layout-heap-layout (sys.int::structure-definition-layout object)) omap stream)
+  ;; TODO: Include layout-instance-slots
+  (save-object (sys.int::structure-definition-sealed object) omap stream)
+  (save-object (sys.int::structure-definition-docstring object) omap stream)
+  (save-object (sys.int::structure-definition-has-standard-constructor object) omap stream)
   (write-byte sys.int::+llf-structure-definition+ stream))
 
-(defmethod save-one-object ((object structure-slot) omap stream)
-  (save-object (structure-slot-name object) omap stream)
-  (save-object (structure-slot-accessor object) omap stream)
-  (save-object (structure-slot-initform object) omap stream)
-  (save-object (structure-slot-type object) omap stream)
-  (save-object (structure-slot-read-only object) omap stream)
+(defmethod save-one-object ((object sys.int::layout) omap stream)
+  (save-one-object (sys.int::layout-class object) omap stream)
+  (write-byte sys.int::+llf-layout+ stream))
+
+(defmethod save-one-object ((object sys.int::structure-slot-definition) omap stream)
+  (save-object (sys.int::structure-slot-definition-name object) omap stream)
+  (save-object (sys.int::structure-slot-definition-accessor object) omap stream)
+  (save-object (sys.int::structure-slot-definition-initform object) omap stream)
+  (save-object (sys.int::structure-slot-definition-type object) omap stream)
+  (save-object (sys.int::structure-slot-definition-read-only object) omap stream)
+  (save-object (sys.int::structure-slot-definition-location object) omap stream)
+  (save-object (sys.int::structure-slot-definition-fixed-vector object) omap stream)
+  (save-object (sys.int::structure-slot-definition-align object) omap stream)
+  (save-object (sys.int::structure-slot-definition-dcas-sibling object) omap stream)
+  (save-object (sys.int::structure-slot-definition-documentation object) omap stream)
   (write-byte sys.int::+llf-structure-slot-definition+ stream))
 
-(defun %single-float-as-integer (value)
+(defun sys.int::%single-float-as-integer (value)
   (check-type value single-float)
-  #+sbcl (ldb (byte 32 0) (sb-kernel:single-float-bits value))
-  #-(or sbcl) (error "Not implemented on this platform!"))
+  (let ((tmp (make-array 4 :element-type '(unsigned-byte 8))))
+    (declare (dynamic-extent tmp))
+    (setf (nibbles:ieee-single-ref/le tmp 0) value)
+    (nibbles:ub32ref/le tmp 0)))
 
-(defun %double-float-as-integer (value)
+(defun sys.int::%double-float-as-integer (value)
   (check-type value double-float)
-  #+sbcl (logior (ash (ldb (byte 32 0) (sb-kernel:double-float-high-bits value)) 32)
-                 (ldb (byte 32 0) (sb-kernel:double-float-low-bits value)))
-  #-(or sbcl) (error "Not implemented on this platform!"))
+  (let ((tmp (make-array 8 :element-type '(unsigned-byte 8))))
+    (declare (dynamic-extent tmp))
+    (setf (nibbles:ieee-double-ref/le tmp 0) value)
+    (nibbles:ub64ref/le tmp 0)))
+
+(defun sys.int::%integer-as-single-float (value)
+  (check-type value (unsigned-byte 32))
+  (let ((tmp (make-array 4 :element-type '(unsigned-byte 8))))
+    (declare (dynamic-extent tmp))
+    (setf (nibbles:ub32ref/le tmp 0) value)
+    (nibbles:ieee-single-ref/le tmp 0)))
+
+(defun sys.int::%integer-as-double-float (value)
+  (check-type value (unsigned-byte 64))
+  (let ((tmp (make-array 8 :element-type '(unsigned-byte 8))))
+    (declare (dynamic-extent tmp))
+    (setf (nibbles:ub64ref/le tmp 0) value)
+    (nibbles:ieee-double-ref/le tmp 0)))
+
+(defun sys.int::%short-float-as-integer (value)
+  (cross-support::cross-short-float-value value))
+
+(defun sys.int::%integer-as-short-float (value)
+  (check-type value (unsigned-byte 16))
+  (cross-support::make-cross-short-float :value value))
 
 (defmethod save-one-object ((object float) omap stream)
   (etypecase object
     (single-float
      (write-byte sys.int::+llf-single-float+ stream)
-     (save-integer (%single-float-as-integer object) stream))
+     (save-integer (sys.int::%single-float-as-integer object) stream))
     (double-float
      (write-byte sys.int::+llf-double-float+ stream)
-     (save-integer (%double-float-as-integer object) stream))))
+     (save-integer (sys.int::%double-float-as-integer object) stream))))
+
+(defmethod save-one-object ((object cross-support::cross-short-float) omap stream)
+  (write-byte sys.int::+llf-short-float+ stream)
+  (save-integer (sys.int::%short-float-as-integer object) stream))
 
 (defmethod save-one-object ((object ratio) omap stream)
   (write-byte sys.int::+llf-ratio+ stream)
@@ -776,8 +810,9 @@
   (dotimes (i (ceiling (length object) 8))
     (let ((octet 0))
       (dotimes (j 8)
-        (when (>= (+ (* i 8) j) (length object)) (return))
-        (setf (ldb (byte 1 j) octet) (bit object j)))
+        (let ((idx (+ (* i 8) j)))
+          (when (>= idx (length object)) (return))
+          (setf (ldb (byte 1 j) octet) (bit object idx))))
       (write-byte octet stream))))
 
 (defmethod save-one-object ((object byte) omap stream)
@@ -795,12 +830,17 @@
      (save-integer (denominator (imagpart object)) stream))
     (single-float
      (write-byte sys.int::+llf-complex-single-float+ stream)
-     (save-integer (%single-float-as-integer (realpart object)) stream)
-     (save-integer (%single-float-as-integer (imagpart object)) stream))
+     (save-integer (sys.int::%single-float-as-integer (realpart object)) stream)
+     (save-integer (sys.int::%single-float-as-integer (imagpart object)) stream))
     (double-float
      (write-byte sys.int::+llf-complex-double-float+ stream)
-     (save-integer (%double-float-as-integer (realpart object)) stream)
-     (save-integer (%double-float-as-integer (imagpart object)) stream))))
+     (save-integer (sys.int::%double-float-as-integer (realpart object)) stream)
+     (save-integer (sys.int::%double-float-as-integer (imagpart object)) stream))))
+
+(defmethod save-one-object ((object cross-support::cross-complex-short-float) omap stream)
+  (write-byte sys.int::+llf-complex-short-float+ stream)
+  (save-integer (sys.int::%short-float-as-integer (cross-support::cross-complex-short-float-realpart object)) stream)
+  (save-integer (sys.int::%short-float-as-integer (cross-support::cross-complex-short-float-imagpart object)) stream))
 
 (defun save-object (object omap stream)
   (let ((info (alexandria:ensure-gethash object omap (list (hash-table-count omap) 0 nil))))
@@ -828,7 +868,7 @@
                     (declare (special ,ltv-sym))
                   (setq ,ltv-sym ,form))
                nil)
-    `(symbol-value ',ltv-sym)))
+    `(sys.int::symbol-global-value ',ltv-sym)))
 
 (defvar *failed-fastload-by-symbol* (make-hash-table))
 
@@ -883,7 +923,8 @@
                                        (princ-to-string *compile-file-pathname*))
                                      sys.int::*top-level-form-number*
                                      lambda-list
-                                     docstring)
+                                     docstring
+                                     nil)
                                nil
                                *target-architecture*))
           env))))
@@ -896,7 +937,9 @@
   (let ((expansion (macroexpand form env)))
     (cond
       ((symbolp expansion)
-       (add-to-llf sys.int::+llf-funcall-n+ expansion 'symbol-value 1))
+       (if (or (keywordp expansion) (member expansion '(nil t)))
+           (add-to-llf nil expansion)
+           (add-to-llf sys.int::+llf-funcall-n+ expansion 'symbol-value 1)))
       ((not (consp expansion))
        ;; Self-evaluating form.
        (add-to-llf nil expansion))
@@ -909,11 +952,27 @@
               (fn (compile-lambda (second expansion) env *target-architecture*)))
          (declare (special *load-time-value-hook*))
          (add-to-llf nil fn)))
+      ((eql (first expansion) 'function)
+       (x-compile-for-value `(fdefinition ',(second form)) env))
       ((eql (first expansion) 'setq)
        (x-compile-for-value `(funcall #'(setf symbol-value)
                                       ,(third form)
                                       ',(second form))
                             env))
+      ((eql (first expansion) 'if)
+       (destructuring-bind (test then &optional else)
+           (rest expansion)
+         (x-compile-for-value test env)
+         (add-to-llf sys.int::+llf-if+)
+         (x-compile-for-value then env)
+         (add-to-llf sys.int::+llf-else+)
+         (x-compile-for-value else env)
+         (add-to-llf sys.int::+llf-fi+)))
+      ((and (eql (first expansion) 'progn)
+            (cdr expansion)
+            (endp (cddr expansion)))
+       ;; Only (progn foo) supported currently.
+       (x-compile-for-value (second expansion) env))
       ((special-operator-p (first expansion))
        ;; Can't convert this, convert it to a zero-argument function and
        ;; call that. PROGN to avoid problems with DECLARE.
@@ -946,39 +1005,47 @@
            (x-compile-for-value arg env))
          (add-to-llf sys.int::+llf-funcall-n+ name (length args)))))))
 
-(defun cross-compile-file (input-file &key
-                           (output-file (make-pathname :type "llf" :defaults input-file))
-                           (verbose *compile-verbose*)
-                           (print *compile-print*)
-                           (external-format :default))
+(defun cross-compile-file (input-file
+                           &key
+                             (output-file (make-pathname :type "llf" :defaults input-file))
+                             (verbose *compile-verbose*)
+                             (print *compile-print*)
+                             (external-format :default)
+                             package)
   (with-open-file (input input-file :external-format external-format)
     (with-open-file (*output-fasl* output-file
                      :element-type '(unsigned-byte 8)
                      :if-exists :supersede
                      :direction :output)
       (write-llf-header *output-fasl* input-file)
-      (let* ((*readtable* (copy-readtable *cross-readtable*))
+      (let* ((*readtable* (copy-readtable *readtable*))
              (*output-map* (make-hash-table))
              (*pending-llf-commands* nil)
-             (*package* (find-package "CL-USER"))
+             (*package* (or (find-package (or package "CROSS-CL-USER"))
+                            (error "Unknown package ~S" package)))
              (*compile-print* print)
              (*compile-verbose* verbose)
              (*compile-file-pathname* (pathname (merge-pathnames input-file)))
              (*compile-file-truename* (truename *compile-file-pathname*))
              (*gensym-counter* 0)
              (cl:*features* *features*)
-             (sys.int::*top-level-form-number* 0))
+             (sys.int::*top-level-form-number* 0)
+             (location-stream (make-instance 'sys.int::location-tracking-stream
+                                             :stream input
+                                             :namestring (namestring *compile-file-pathname*))))
         (when *compile-verbose*
           (format t ";; Cross-compiling ~S~%" input-file))
-        (loop for form = (read input nil input) do
-             (when (eql form input)
-               (return))
-             (when *compile-print*
-               (let ((*print-length* 3)
-                     (*print-level* 2))
-                 (format t ";; X-compiling: ~S~%" form)))
-             (x-compile-top-level form nil)
-             (incf sys.int::*top-level-form-number*))
+        (sys.int::with-reader-location-tracking
+          (loop
+             for form = (read location-stream nil input)
+             until (eql form input)
+             do
+               (when *compile-print*
+                 (let ((*print-length* 3)
+                       (*print-level* 2))
+                   (format t ";; X-compiling: ~S~%" form)))
+               (x-compile-top-level form nil)
+               (incf sys.int::*top-level-form-number*)))
         ;; Now write everything to the fasl.
         ;; Do two passes to detect circularity.
         (let ((commands (reverse *pending-llf-commands*)))
@@ -1000,8 +1067,8 @@
                            (print *compile-print*)
                            (external-format :default))
   (with-open-file (input input-file :external-format external-format)
-    (let* ((*readtable* (copy-readtable *cross-readtable*))
-           (*package* (find-package "CL-USER"))
+    (let* ((*readtable* (copy-readtable *readtable*))
+           (*package* (find-package "CROSS-CL-USER"))
            (*compile-print* print)
            (*compile-verbose* verbose)
            (*compile-file-pathname* (pathname (merge-pathnames input-file)))
@@ -1020,31 +1087,32 @@
            (x-compile-top-level form nil :not-compile-time))))
   t)
 
-(defun save-compiler-builtins (path target-architecture)
+(defun save-custom-compiled-file (path generator)
   (with-open-file (*output-fasl* path
                    :element-type '(unsigned-byte 8)
                    :if-exists :supersede
                    :direction :output)
-    (format t ";; Writing compiler builtins to ~A.~%" path)
     (write-llf-header *output-fasl* path)
-    (let* ((builtins (ecase target-architecture
-                       (:x86-64 (mezzano.compiler.codegen.x86-64:generate-builtin-functions))
-                       (:arm64 (mezzano.compiler.codegen.arm64:generate-builtin-functions))))
-           (*readtable* (copy-readtable *cross-readtable*))
+    (let* ((*readtable* (copy-readtable *readtable*))
            (*output-map* (make-hash-table))
            (*pending-llf-commands* nil)
-           (*package* (find-package "CL-USER"))
+           (*package* (find-package "CROSS-CL-USER"))
            (*compile-print* *compile-print*)
            (*compile-verbose* *compile-verbose*)
-           (*compile-file-pathname* (pathname (merge-pathnames path)))
-           (*compile-file-truename* (truename *compile-file-pathname*))
+           (*compile-file-pathname* nil)
+           (*compile-file-truename* nil)
            (*gensym-counter* 0))
-      (dolist (b builtins)
-        (let ((form `(sys.int::%defun ',(first b) ,(second b))))
-          (let ((*print-length* 3)
-                (*print-level* 3))
-            (format t ";; Compiling form ~S.~%" form))
-          (x-compile form nil)))
+      (loop
+         for values = (multiple-value-list (funcall generator))
+         for form = (first values)
+         do
+           (when (not values)
+             (return))
+           (when *compile-print*
+             (let ((*print-length* 3)
+                   (*print-level* 2))
+               (format t ";; X-compiling: ~S~%" form)))
+           (x-compile-top-level form nil))
       ;; Now write everything to the fasl.
       ;; Do two passes to detect circularity.
       (let ((commands (reverse *pending-llf-commands*)))
@@ -1060,11 +1128,25 @@
               (write-byte (car cmd) *output-fasl*)))))
       (write-byte sys.int::+llf-end-of-load+ *output-fasl*))))
 
+(defun save-compiler-builtins (path target-architecture)
+  (format t ";; Writing compiler builtins to ~A.~%" path)
+  (let* ((builtins (ecase target-architecture
+                     (:x86-64 (mezzano.compiler.backend.x86-64::generate-builtin-functions))
+                     (:arm64 (mezzano.compiler.backend.arm64::generate-builtin-functions))))
+         (*use-new-compiler* nil)
+         (*target-architecture* target-architecture))
+    (save-custom-compiled-file path
+                               (lambda ()
+                                 (if builtins
+                                     (let ((b (pop builtins)))
+                                       `(sys.int::%defun ',(first b) ,(second b)))
+                                     (values))))))
+
 (deftype sys.int::non-negative-fixnum ()
   `(integer 0 ,most-positive-fixnum))
 
 (defun sys.int::fixnump (object)
-  (sys.c::fixnump object))
+  (fixnump object))
 
 (defun mezzano.runtime::left-shift (integer count)
   (check-type integer integer)
@@ -1081,3 +1163,173 @@
   ;; It's not currently needed by any of the cross-compiled files.
   (declare (ignore env))
   (eval lambda))
+
+(defparameter *cross-logical-base* "SYS:SOURCE")
+
+(defun namestring (pathname)
+  ;; Convert back to a relative path, then emit as a logical pathname.
+  (let ((p (enough-namestring pathname)))
+    (format nil "~:@(~A;~{~A;~}~A.~A.NEWEST~)"
+            *cross-logical-base*
+            (rest (pathname-directory p))
+            (pathname-name p)
+            (pathname-type p))))
+
+(defun function-inline-info (name)
+  (values (eql (gethash name cross-support::*inline-modes*) t)
+          (gethash name cross-support::*inline-forms*)))
+
+(defun sys.int::convert-structure-class-to-structure-definition (def)
+  (check-type def sys.int::structure-definition)
+  def)
+
+(defgeneric mezzano.clos:class-slots (class)
+  (:method ((class sys.int::structure-definition))
+    (sys.int::structure-definition-slots class)))
+
+(defgeneric mezzano.clos:class-sealed (class)
+  (:method ((class sys.int::structure-definition))
+    (sys.int::structure-definition-sealed class)))
+
+(defgeneric mezzano.clos:class-layout (class)
+  (:method ((class sys.int::structure-definition))
+    (sys.int::structure-definition-layout class)))
+
+(defgeneric mezzano.clos:slot-definition-name (slot-definition)
+  (:method ((slot-definition sys.int::structure-slot-definition))
+    (sys.int::structure-slot-definition-name slot-definition)))
+
+(defgeneric mezzano.clos:slot-definition-type (slot-definition)
+  (:method ((slot-definition sys.int::structure-slot-definition))
+    (sys.int::structure-slot-definition-type slot-definition)))
+
+(defgeneric mezzano.clos:slot-definition-location (slot-definition)
+  (:method ((slot-definition sys.int::structure-slot-definition))
+    (sys.int::structure-slot-definition-location slot-definition)))
+
+(defgeneric mezzano.clos:structure-slot-definition-fixed-vector (slot-definition)
+  (:method ((slot-definition sys.int::structure-slot-definition))
+    (sys.int::structure-slot-definition-fixed-vector slot-definition)))
+
+(defun mezzano.clos:ensure-class (name &rest initargs)
+  (remf initargs :source-location)
+  (apply #'c2mop:ensure-class name initargs))
+
+(defun sys.int::known-declaration-p (declaration)
+  ;; The normal version also checks type specifiers, but I don't like that style.
+  ;; Always use (type foo ..)  over (foo ..)
+  (member declaration '(special constant sys.int::global inline notinline
+                        sys.int::maybe-inline type ftype declaration optimize)))
+
+(in-package :mezzano.internals)
+
+(defgeneric location-tracking-stream-line (stream)
+  (:method (stream) nil))
+(defgeneric location-tracking-stream-character (stream)
+  (:method (stream) nil))
+
+(defclass location-tracking-stream (trivial-gray-streams:fundamental-character-input-stream)
+  ((%stream :initarg :stream :reader location-tracking-stream-stream)
+   (%namestring :initarg :namestring :reader location-tracking-stream-namestring)
+   (%line :initarg :line :accessor location-tracking-stream-line)
+   (%character :initarg :character :accessor location-tracking-stream-character)
+   (%unread-character :accessor location-tracking-stream-unread-character))
+  (:default-initargs :character 0 :line 1))
+
+(defgeneric location-tracking-stream-location (stream)
+  (:documentation "Return a SOURCE-LOCATION indicating the current location in the stream. Returns NIL if location tracking is unavailable.
+This should only fill in the START- slots and ignore the END- slots.")
+  (:method (stream) nil))
+
+(defmethod location-tracking-stream-location ((stream location-tracking-stream))
+  (make-source-location
+   :file (location-tracking-stream-namestring stream)
+   :top-level-form-number *top-level-form-number*
+   :position (let ((inner (location-tracking-stream-stream stream)))
+               (if (typep inner 'file-stream)
+                   (file-position inner)
+                   nil))
+   :line (location-tracking-stream-line stream)
+   :character (location-tracking-stream-character stream)))
+
+(defmethod trivial-gray-streams:stream-read-char ((stream location-tracking-stream))
+  (let ((ch (read-char (location-tracking-stream-stream stream) nil :eof)))
+    (cond ((eql ch :eof))
+          ((eql ch #\Newline)
+           (incf (location-tracking-stream-line stream))
+           (setf (location-tracking-stream-unread-character stream)
+                 (location-tracking-stream-character stream))
+           (setf (location-tracking-stream-character stream) 0))
+          (t
+           (setf (location-tracking-stream-unread-character stream)
+                 (location-tracking-stream-character stream))
+           (incf (location-tracking-stream-character stream))))
+    ch))
+
+(defmethod trivial-gray-streams:stream-unread-char ((stream location-tracking-stream) character)
+  (when (eql character #\Newline)
+    (decf (location-tracking-stream-line stream)))
+  (setf (location-tracking-stream-character stream)
+        (location-tracking-stream-unread-character stream))
+  (unread-char character (location-tracking-stream-stream stream)))
+
+(defun mezzano.supervisor:make-rw-lock (&optional name)
+  (declare (ignore name))
+  :rw-lock)
+
+(defun mezzano.supervisor:rw-lock-read-acquire (lock &optional wait-p)
+  (declare (ignore lock wait-p))
+  t)
+
+(defun mezzano.supervisor:rw-lock-read-release (lock)
+  (declare (ignore lock))
+  (values))
+
+(defun mezzano.supervisor:rw-lock-write-acquire (lock &optional wait-p)
+  (declare (ignore lock wait-p))
+  t)
+
+(defun mezzano.supervisor:rw-lock-write-release (lock)
+  (declare (ignore lock))
+  (values))
+
+(defmacro mezzano.supervisor:with-rw-lock-read ((lock) &body body)
+  `(progn ,@body))
+
+(defmacro mezzano.supervisor:with-rw-lock-write ((lock) &body body)
+  `(progn ,@body))
+
+(defun mezzano.extensions:add-find-definitions-hook (hook)
+  (declare (ignore hook))
+  (values))
+
+(macrolet ((x (nib int)
+             `(progn (defun ,int (vec index) (,nib vec index))
+                     (defun (setf ,int) (val vec index) (setf (,nib vec index) val)))))
+   (x nibbles:ub16ref/le mezzano.extensions:ub16ref/le)
+   (x nibbles:ub32ref/le mezzano.extensions:ub32ref/le)
+   (x nibbles:ub64ref/le mezzano.extensions:ub64ref/le))
+
+;; Used as part of reading short-floats
+(defun coerce (object result-type)
+  (cond ((eql result-type 'short-float)
+         (ecase object
+           (0.0d0 (cross-support::make-cross-short-float :value #x0000))
+           (1.0d0 (cross-support::make-cross-short-float :value #x3C00))))
+        (t
+         (cl:coerce object result-type))))
+
+(defun complex (realpart imagpart)
+  (cond ((or (cross-support::cross-short-float-p realpart)
+             (cross-support::cross-short-float-p imagpart))
+         ;; TODO: Promote as appropriate.
+         (assert (cross-support::cross-short-float-p realpart))
+         (assert (cross-support::cross-short-float-p imagpart))
+         (cross-support::make-cross-complex-short-float
+          :realpart realpart
+          :imagpart imagpart))
+        (t
+         (cl:complex realpart imagpart))))
+
+(defun short-float-p (object)
+  (cross-support::cross-short-float-p object))

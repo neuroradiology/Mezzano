@@ -1,9 +1,50 @@
-;;;; Copyright (c) 2011-2016 Henry Harrington <henry.harrington@gmail.com>
-;;;; This code is licensed under the MIT license.
-
 ;;;; Bootstrap macros and functions for the cross-compiler.
 
-(in-package :sys.c)
+(in-package :cross-support)
+
+(defun make-hash-table (&rest args &key test size rehash-size rehash-threshold synchronized enforce-gc-invariant-keys weakness)
+  (declare (ignore test size rehash-size rehash-threshold synchronized enforce-gc-invariant-keys weakness))
+  (remf args :synchronized)
+  (remf args :enforce-gc-invariant-keys)
+  (apply #'cl:make-hash-table args))
+
+(defvar *system-macros* (make-hash-table :test 'eq))
+(defvar *system-compiler-macros* (make-hash-table :test 'equal))
+(defvar *system-symbol-macros* (make-hash-table :test 'eq))
+(defvar *system-symbol-declarations* (make-hash-table :test 'eq))
+(defvar *structure-types* (make-hash-table :test 'eq))
+
+(eval-when (:compile-toplevel :load-toplevel :execute)
+  (defun remove-&environment (orig-lambda-list)
+    (do* ((lambda-list (copy-list orig-lambda-list))
+          (prev nil i)
+          (i lambda-list (cdr i)))
+         ((null i) (values lambda-list nil))
+      (when (eql (first i) '&environment)
+        (assert (not (null (cdr i))) ()
+                "Missing variable after &ENVIRONMENT.")
+        (if prev
+            (setf (cdr prev) (cddr i))
+            (setf lambda-list (cddr i)))
+        (assert (not (member '&environment lambda-list)) ()
+                "Duplicate &ENVIRONMENT variable in lambda-list ~S." orig-lambda-list)
+        (return (values lambda-list (second i)))))))
+
+(cl:defmacro def-x-macro (name lambda-list &body body)
+  (let ((whole))
+    (multiple-value-bind (fixed-lambda-list env)
+        (remove-&environment lambda-list)
+      (when (null env)
+        (setf env (gensym)))
+      (if (eql (first fixed-lambda-list) '&whole)
+          (setf whole (second fixed-lambda-list)
+                fixed-lambda-list (cddr fixed-lambda-list))
+          (setf whole (gensym)))
+      `(setf (gethash ',name *system-macros*)
+             (lambda (,whole ,env)
+               (declare (ignorable ,whole ,env))
+               (destructuring-bind ,fixed-lambda-list (cdr ,whole)
+                 (block ,name ,@body)))))))
 
 (setf (gethash 'cross-cl:defconstant *system-macros*)
       (cl:macro-function 'cross-cl:defconstant))
@@ -34,15 +75,25 @@
       (setf (gethash name *inline-forms*) source-lambda))
   nil)
 
-(defun sys.int::%defun (name lambda)
-  ;; Completely ignore CAS functions when cross compiling, they're not needed.
-  (unless (and (consp name) (eql (first name) 'sys.int::cas))
-    (setf (fdefinition name) lambda))
-  name)
+(defun cas-hash-table (key hash-table default old new)
+  ;; This isn't a truely thread-safe implementation, but the cold
+  ;; generator is single threaded anyway.
+  (let ((existing (gethash key hash-table default)))
+    (when (eql old existing)
+      (setf (gethash key hash-table) new))
+    existing))
 
-(defun function-inline-info (name)
-  (values (gethash name *inline-modes*)
-          (gethash name *inline-forms*)))
+(defun sys.int::set-variable-docstring (name docstring)
+  (declare (ignore name docstring)))
+
+(defun sys.int::set-setf-docstring (name docstring)
+  (declare (ignore name docstring)))
+
+(defun sys.int::set-type-docstring (name docstring)
+  (declare (ignore name docstring)))
+
+(defun sys.int::set-variable-source-location (name source-location &optional style)
+  (declare (ignore name source-location style)))
 
 (defvar *variable-types* (make-hash-table))
 
@@ -73,8 +124,8 @@
     (setf (cl:macro-function name) lambda))
   (setf (gethash name *system-macros*) lambda))
 
-(defun sys.int::%defconstant (name value &optional docstring)
-  (declare (ignore docstring))
+(defun sys.int::%defconstant (name value source-location &optional docstring)
+  (declare (ignore source-location docstring))
   (when (or (not (boundp name))
             (not (loose-constant-equal (symbol-value name) value)))
     (eval `(cl:defconstant ,name ',value))))
@@ -114,6 +165,9 @@
     (notinline
      (dolist (name (rest declaration-specifier))
        (setf (gethash name *inline-modes*) nil)))
+    (sys.int::maybe-inline
+     (dolist (name (rest declaration-specifier))
+       (setf (gethash name *inline-modes*) :maybe)))
     (type
      (destructuring-bind (typespec &rest vars)
          (rest declaration-specifier)
@@ -128,7 +182,7 @@
 
 (defun sys.int::symbol-mode (symbol)
   (check-type symbol symbol)
-  (values (gethash symbol *system-symbol-declarations*)))
+  (sys.int::variable-information symbol))
 
 (defun mezzano.runtime::symbol-type (symbol)
   (check-type symbol symbol)
@@ -151,59 +205,139 @@
 (defun sys.int::concat-symbols (&rest symbols)
   (intern (apply 'concatenate 'string (mapcar 'string symbols))))
 
-(defun sys.int::structure-name (x) (structure-type-name x))
-(defun sys.int::structure-slots (x) (structure-type-slots x))
+(defstruct cross-struct
+  type
+  data)
 
-(defstruct cross-struct data)
+(defun sys.int::%defstruct (def &key location)
+  (declare (ignore location))
+  (when (gethash (sys.int::structure-definition-name def) *structure-types*)
+    ;; FIXME: Check compatibility here.
+    (return-from sys.int::%defstruct def))
+  (unless (member (sys.int::structure-definition-name def)
+                  '(sys.int::structure-definition
+                    sys.int::structure-slot-definition
+                    sys.int::layout))
+    (let ((predicate (gensym (string (sys.int::structure-definition-name def)))))
+      (setf (symbol-function predicate) (lambda (x)
+                                          (sys.int::structure-type-p x def)))
+      (unless (or (eql (symbol-package (sys.int::structure-definition-name def))
+                       (find-package "CL"))
+                  (eql (symbol-package (sys.int::structure-definition-name def))
+                       (find-package "MEZZANO.COMPILER")))
+        (eval `(cl:deftype ,(sys.int::structure-definition-name def) () '(satisfies ,predicate))))))
+  (setf (gethash (sys.int::structure-definition-name def) *structure-types*) def))
 
-(defun sys.int::%defstruct (def)
-  (when (gethash (structure-type-name def) *structure-types*)
-    (assert (eql (gethash (structure-type-name def) *structure-types*) def))
-    (assert (eql (get (structure-type-name def) 'sys.int::structure-type) def)))
-  (let ((predicate (gensym (string (structure-type-name def)))))
-    (setf (symbol-function predicate) (lambda (x)
-                                        (and (cross-struct-p x)
-                                             (eql (sys.int::%struct-slot x 0) def))))
-    (unless (or (eql (symbol-package (structure-type-name def))
-                     (find-package "CL"))
-                (eql (symbol-package (structure-type-name def))
-                     (find-package "SYS.C")))
-      (eval `(cl:deftype ,(structure-type-name def) () '(satisfies ,predicate))))
-    (setf (get (structure-type-name def) 'sys.int::structure-type) def)
-    (setf (gethash (structure-type-name def) *structure-types*) def)))
+(defun sys.int::%allocate-struct (definition)
+  (when (symbolp definition)
+    (setf definition (sys.int::get-structure-type definition)))
+  (make-cross-struct
+   :type definition
+   :data (make-array (length (sys.int::structure-definition-slots definition)))))
 
-(defun sys.int::%make-struct (length area)
-  (declare (ignore area))
-  (make-cross-struct :data (make-array length)))
+(defun sys.int::structure-slot-index (def slot-name)
+  (position slot-name
+            (sys.int::structure-definition-slots (sys.int::get-structure-type def))
+            :key #'sys.int::structure-slot-definition-name))
 
-(defun sys.int::%struct-slot (struct index)
-  (aref (cross-struct-data struct) index))
-(defun (setf sys.int::%struct-slot) (value struct index)
-  (setf (aref (cross-struct-data struct) index) value))
+(defun sys.int::%struct-slot (struct def slot-name)
+  (aref (cross-struct-data struct) (sys.int::structure-slot-index def slot-name)))
+(defun (setf sys.int::%struct-slot) (value struct def slot-name)
+  (setf (aref (cross-struct-data struct) (sys.int::structure-slot-index def slot-name)) value))
 
 (defun sys.int::get-structure-type (name &optional (errorp t))
   (or (gethash name *structure-types*)
       (and errorp
            (error "Unknown structure type ~S." name))))
 
-(defun sys.int::structure-object-p (object)
-  (cross-struct-p object))
-
 (defun sys.int::structure-type-p (object struct-type)
   (when (cross-struct-p object)
-    (do ((object-type (sys.int::%struct-slot object 0)
-                      (structure-type-parent object-type)))
-        ((not (structure-type-p object-type))
+    (do ((object-type (cross-struct-type object)
+                      (sys.int::structure-definition-parent object-type)))
+        ((not (sys.int::structure-definition-p object-type))
          nil)
-      (when (eq object-type struct-type)
+      ;; Work by name as defstruct isn't unifying struct definitions any more.
+      (when (eq (sys.int::structure-definition-name object-type)
+                (sys.int::structure-definition-name struct-type))
         (return t)))))
 
 (defconstant sys.int::most-positive-fixnum (- (expt 2 62) 1))
 (defconstant sys.int::most-negative-fixnum (- (expt 2 62)))
 (alexandria:define-constant sys.int::lambda-list-keywords
-    '(&allow-other-keys &aux &body &environment &key &optional &rest &whole sys.int::&fref sys.int::&closure)
+    '(&allow-other-keys &aux &body &environment &key &optional &rest &whole sys.int::&closure)
   :test 'equal)
 (defvar sys.int::*features* '(:unicode :little-endian :mezzano :ieee-floating-point :ansi-cl :common-lisp))
+
+;; Replicated from system/package.lisp. Needed to define packages in package.lisp
+(in-package :mezzano.internals)
+(defmacro defpackage (defined-package-name &rest options)
+  (let ((nicknames '())
+        (documentation nil)
+        (use-list '())
+        (import-list '())
+        (export-list '())
+        (intern-list '())
+        (shadow-list '())
+        (shadow-import-list '())
+        (local-nicknames '()))
+    (dolist (o options)
+      (ecase (first o)
+        (:nicknames
+         (dolist (n (rest o))
+           (pushnew (string n) nicknames)))
+        (:documentation
+         (when documentation
+           (error "Multiple documentation options in DEFPACKAGE form."))
+         (unless (or (eql 2 (length o))
+                     (not (stringp (second o))))
+           (error "Invalid documentation option in DEFPACKAGE form."))
+         (setf documentation (second o)))
+        (:use
+         (dolist (u (rest o))
+           (if (packagep u)
+               (pushnew u use-list)
+               (pushnew (string u) use-list))))
+        (:import-from
+         (let ((package (find-package-or-die (second o))))
+           (dolist (name (cddr o))
+             (multiple-value-bind (symbol status)
+                 (find-symbol (string name) package)
+               (unless status
+                 (error "No such symbol ~S in package ~S." (string name) package))
+               (pushnew symbol import-list)))))
+        (:export
+         (dolist (name (cdr o))
+           (pushnew name export-list)))
+        (:intern
+         (dolist (name (cdr o))
+           (pushnew name intern-list)))
+        (:shadow
+         (dolist (name (cdr o))
+           (pushnew name shadow-list)))
+        (:shadowing-import-from
+         (let ((package (find-package-or-die (second o))))
+           (dolist (name (cddr o))
+             (multiple-value-bind (symbol status)
+                 (find-symbol (string name) package)
+               (unless status
+                 (error "No such symbol ~S in package ~S." (string name) package))
+               (pushnew symbol shadow-import-list)))))
+        (:size)
+        (:local-nicknames
+         (setf local-nicknames (append local-nicknames (rest o))))))
+    `(eval-when (:compile-toplevel :load-toplevel :execute)
+       (%defpackage ,(string defined-package-name)
+                    :nicknames ',nicknames
+                    :documentation ',documentation
+                    :uses ',use-list
+                    :imports ',import-list
+                    :exports ',export-list
+                    :interns ',intern-list
+                    :shadows ',shadow-list
+                    :shadowing-imports ',shadow-import-list
+                    :local-nicknames ',local-nicknames))))
+
+(in-package :cross-support)
 
 (defun sys.int::%defpackage (name &key
                                     nicknames
@@ -264,13 +398,6 @@
      lo))
   #-sbcl (error "Not supported on this platform."))
 
-(macrolet ((x (nib int)
-             `(progn (defun ,int (vec index) (,nib vec index))
-                     (defun (setf ,int) (val vec index) (setf (,nib vec index) val)))))
-   (x nibbles:ub16ref/le sys.int::ub16ref/le)
-   (x nibbles:ub32ref/le sys.int::ub32ref/le)
-   (x nibbles:ub64ref/le sys.int::ub64ref/le))
-
 (defun sys.int::binary-= (x y) (= x y))
 (defun sys.int::binary-< (x y) (< x y))
 (defun sys.int::binary-<= (x y) (<= x y))
@@ -285,5 +412,48 @@
 (defun sys.int::binary-logxor (x y) (logxor x y))
 (defun mezzano.runtime::%fixnum-< (x y) (< x y))
 
-(defun mezzano.clos:class-precedence-list (class)
-  (sb-mop:class-precedence-list class))
+(defun convert-internal-time-units (time)
+  (* time
+     (/ internal-time-units-per-second
+        cl:internal-time-units-per-second)))
+
+(defun get-internal-run-time ()
+  (convert-internal-time-units
+   (cl:get-internal-run-time)))
+
+(defun get-internal-real-time ()
+  (convert-internal-time-units
+   (cl:get-internal-real-time)))
+
+(defun sys.int::%type-check (object tag type)
+  (declare (ignore tag))
+  (when (not (typep object type))
+    (error "Type error: ~S not of type ~S." object type)))
+
+(defun sys.int::latin1-char-p (character)
+  (check-type character character)
+  (< (char-code character) 256))
+
+(defun sys.int::frob-stream (stream default)
+  (cond ((eql stream 'nil)
+         default)
+        ((eql stream 't)
+         *terminal-io*)
+        (t
+         ;; TODO: check that the stream is open.
+         (check-type stream stream)
+         stream)))
+
+(defun sys.int::frob-input-stream (stream)
+  (sys.int::frob-stream stream *standard-input*))
+
+(defun sys.int::frob-output-stream (stream)
+  (sys.int::frob-stream stream *standard-output*))
+
+(defmacro sys.int::with-stream-editor ((stream recursive-p) &body body)
+  (declare (ignore stream recursive-p))
+  `(progn ,@body))
+
+(defun sys.int::typeexpand (type &optional environment)
+  (declare (ignore environment))
+  type)

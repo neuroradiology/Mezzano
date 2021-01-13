@@ -1,5 +1,4 @@
-;;;; Copyright (c) 2011-2016 Henry Harrington <henry.harrington@gmail.com>
-;;;; This code is licensed under the MIT license.
+;;;; Generic framebuffer interface
 
 (in-package :mezzano.supervisor)
 
@@ -17,7 +16,9 @@ Can be :TOP to position them at the top of the screen, :BOTTOM to position them 
   layout
   damage-fn
   blit-fn
-  fill-fn)
+  fill-fn
+  device
+  boot-id)
 
 (sys.int::defglobal *current-framebuffer* nil)
 (sys.int::defglobal *debug-video-x* 0)
@@ -41,15 +42,15 @@ Can be :TOP to position them at the top of the screen, :BOTTOM to position them 
         (layout (ecase (boot-field +boot-information-framebuffer-layout+)
                   (1 :x8r8g8b8)
                   (5 :r8g8b8))))
-    (map-physical-memory (logand phys (lognot #xFFF))
-                         (logand (+ (* height pitch) (logand phys #xFFF) #xFFF) (lognot #xFFF))
-                         "System Framebuffer")
-    (video-set-framebuffer phys width height pitch layout nil)))
+    (map-physical-memory-early (logand phys (lognot #xFFF))
+                               (logand (+ (* height pitch) (logand phys #xFFF) #xFFF) (lognot #xFFF))
+                               "System Framebuffer")
+    (video-set-framebuffer phys width height pitch layout)))
 
 (defun framebuffer-dummy-damage (x y w h in-unsafe-context-p)
   (declare (ignore x y w h in-unsafe-context-p)))
 
-(defun video-set-framebuffer (phys width height pitch layout damage-fn)
+(defun video-set-framebuffer (phys width height pitch layout &key damage-fn device)
   (debug-print-line "Configured new framebuffer at " phys "  " width "x" height "  layout " layout "  pitch " pitch)
   (multiple-value-bind (bytes-per-pixel blit-fn fill-fn)
       (ecase layout
@@ -63,8 +64,10 @@ Can be :TOP to position them at the top of the screen, :BOTTOM to position them 
                                                   :layout layout
                                                   :damage-fn (or damage-fn
                                                                  'framebuffer-dummy-damage)
+                                                  :device device
                                                   :blit-fn blit-fn
-                                                  :fill-fn fill-fn)))
+                                                  :fill-fn fill-fn
+                                                  :boot-id (current-boot-id))))
   (set-run-light t)
   (setf *debug-video-x* 0
         *debug-video-y* 0
@@ -97,7 +100,10 @@ If the framebuffer is invalid, the caller should fetch the current framebuffer a
         (from-width (array-dimension from-array 1))
         (from-height (array-dimension from-array 0)))
     ;; Check for displaced arrays.
-    (when (integerp (sys.int::%complex-array-info from-array))
+    (when (sys.int::%complex-array-info from-array)
+      (when (integerp from-storage)
+        ;; Memory array
+        (error "Can't copy from a memory array"))
       (setf from-offset (sys.int::%complex-array-info from-array)
             from-storage (sys.int::%complex-array-storage from-storage)))
     ;; Storage must be a simple ub32 array.
@@ -291,14 +297,20 @@ If the framebuffer is invalid, the caller should fetch the current framebuffer a
 An integer, measured in internal time units.")
 (sys.int::defglobal *lights* '())
 
+(defun decay-light (light dt)
+  (let ((current-state (light-state light)))
+    (when (integerp current-state)
+      (let ((new-state (- current-state dt)))
+        (cond ((<= new-state 0)
+               (clear-light light))
+              (t
+               (sys.int::cas (light-state light) current-state new-state)))))))
+
 (defun decay-lights (dt)
   (when (boundp '*lights*)
     (loop
        for light in *lights*
-       do (when (integerp (light-state light))
-            (decf (light-state light) dt)
-            (when (<= (light-state light) 0)
-              (clear-light light))))))
+       do (decay-light light dt))))
 
 (defun set-light (light state)
   (setf (light-state light) (if state
@@ -419,6 +431,15 @@ An integer, measured in internal time units.")
   (dotimes (i (string-length string))
     (debug-video-write-char (char string i))))
 
+(defun debug-video-flush-buffer (buf)
+  (let ((buf-data (car buf)))
+    ;; To get inline wired accessors....
+    (declare (type (simple-array (unsigned-byte 8) (*)) buf-data)
+             (optimize speed (safety 0)))
+    (dotimes (i (cdr buf))
+      (let ((byte (aref buf-data (the fixnum i))))
+        (debug-video-write-char (code-char byte))))))
+
 (defun debug-video-stream (op &optional arg)
   (ecase op
     (:read-char (loop (thread-yield)))
@@ -426,4 +447,5 @@ An integer, measured in internal time units.")
     (:write-char (debug-video-write-char arg))
     (:write-string (debug-video-write-string arg))
     (:force-output)
-    (:start-line-p (eql *debug-video-x* 0))))
+    (:start-line-p (eql *debug-video-x* 0))
+    (:flush-buffer (debug-video-flush-buffer arg))))

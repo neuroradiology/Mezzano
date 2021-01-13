@@ -1,47 +1,78 @@
-;;;; Copyright (c) 2011-2016 Henry Harrington <henry.harrington@gmail.com>
-;;;; This code is licensed under the MIT license.
+;;;; Initial Program Load.
+;;;;
+;;;; This file loads loads and configures the rest of the system,
+;;;; once the core Lisp environment is operational.
 
-(in-package :cl-user)
+(in-package :mezzano.internals)
 
-(defun sys.int::setup-for-release ()
-  (load "tools/load-sources.lisp")
-  (setf (sys.int::symbol-global-value '*package*) (find-package :cl-user))
-  (setf *default-pathname-defaults* (pathname "LOCAL:>")
-        mezzano.file-system::*home-directory* *default-pathname-defaults*)
-  (setf (mezzano.file-system:find-host :remote) nil)
-  (when (y-or-n-p "Snapshot?")
-    (sys.int::snapshot-and-exit)))
+;; Take over the debugger for the duration, this so that early errors
+;; can be caught and made to produce a sensible error instead of
+;; "serial read char not implemented"
+;; This is undone at the end of the file.
+(defun ipl-debugger (condition)
+  (format t "----- ERROR -----~%")
+  (format t "Error during warm initialization:~%")
+  (format t "~A~%" condition)
+  (mezzano.supervisor:panic (format nil "~A" condition)))
+(setf mezzano.debug:*global-debugger* 'ipl-debugger)
 
 ;; Fast eval mode.
 (setf sys.int::*eval-hook* 'mezzano.fast-eval:eval-in-lexenv)
 
+;;; mezzano.file-system::*filesystem-alist* is a mapping from
+;;; partition UUIDs to file system host names. These mappings should
+;;; be set up for the local system configuration. For example:
+;;;
+;;; (setf mezzano.file-system::*filesystems-alist*
+;;;       '(("8F51-4F7E" MNT)
+;;;         ("a3a2162c-6272-401b-b621-a97b65c3f871" HOME)))
+;;;
+;;; For FAT file systems, the 32-bit BS_VolID (Volume serial number)
+;;; is used as the "UUID" - for example the MNT entry in the example
+;;; above.
+
+;; register supervisor disks as block devices
+(mezzano.disk:register-supervisor-disks)
+
 ;; Host where the initial system is kept.
 ;; Change the IP to the host computer's local IP.
-(mezzano.file-system.remote:add-simple-file-host :remote sys.int::*file-server-host-ip*)
+(mezzano.file-system.remote:add-remote-file-host :remote sys.int::*file-server-host-ip*)
 ;; Use PATHNAME instead of #p because the cross-compiler doesn't support #p.
 ;; Point *DEFAULT-PATHNAME-DEFAULTS* at the full path to the source tree.
-(setf *default-pathname-defaults* (pathname (concatenate 'string "REMOTE:" sys.int::*mezzano-source-path*)))
+(setf *default-pathname-defaults* (pathname *mezzano-source-path*))
 ;; Point MEZZANO.FILE-SYSTEM::*HOME-DIRECTORY* at the home directory containing the libraries.
-(setf mezzano.file-system::*home-directory* (pathname (concatenate 'string "REMOTE:" sys.int::*home-directory-path*)))
+(setf mezzano.file-system::*home-directory* (pathname *home-directory-path*))
 
-(push (list "SOURCE;**;*.*.*" (merge-pathnames "**/" *default-pathname-defaults*))
+(push (list "SOURCE;**;*.*.*" (merge-pathnames (make-pathname :directory '(:relative :wild-inferiors))
+                                               *default-pathname-defaults*))
       (logical-pathname-translations "SYS"))
 
-(push (list "HOME;**;*.*.*" (merge-pathnames "**/" (user-homedir-pathname)))
+(push (list "HOME;**;*.*.*" (merge-pathnames  (make-pathname :directory '(:relative :wild-inferiors))
+                                              (user-homedir-pathname)))
       (logical-pathname-translations "SYS"))
 
 (defun sys.int::check-connectivity ()
-  ;; Make sure that there's one network card.
-  (when (null mezzano.network.ethernet::*cards*)
-    (format t "No network cards detected!~%~
+  ;; Make sure that there's one network card, excluding the loopback adapter.
+  (flet ((known-interfaces ()
+           (remove-if (lambda (x) (typep (first x) 'mezzano.network::loopback-interface))
+                      mezzano.network.ip::*ipv4-interfaces*)))
+    (loop
+       with timeout = 30.0
+       do
+         (when (known-interfaces)
+           (return))
+         (when (minusp timeout)
+           (format t "No network cards detected!~%~
 Make sure there is a virtio-net NIC attached.~%")
-    (return-from sys.int::check-connectivity))
-  (when (not (null (rest mezzano.network.ethernet::*cards*)))
-    (format t "Multiple network cards detected! Not supported, but trying anyway.~%"))
-  (format t "Using network card ~S.~%" (first mezzano.network.ethernet::*cards*))
+           (return-from sys.int::check-connectivity))
+         (sleep 0.1)
+         (decf timeout 0.1))
+    (when (not (null (rest (known-interfaces))))
+      (format t "Multiple network cards detected! Not supported, but trying anyway.~%"))
+    (format t "Using network card ~S.~%" (first (first (known-interfaces)))))
   ;; Check connectivity to the file-server.
   (let ((fs-address (mezzano.network.ip:make-ipv4-address sys.int::*file-server-host-ip*)))
-    (format t "File server has address ~A, port ~D.~%" fs-address mezzano.file-system.remote::*default-simple-file-port*)
+    (format t "File server has address ~A, port ~D.~%" fs-address mezzano.file-system.remote::*default-remote-file-port*)
     (when (mezzano.network.ip:address-equal
            (mezzano.network.ip:address-network fs-address 24)
            (mezzano.network.ip:make-ipv4-address "10.0.2.0"))
@@ -66,7 +97,7 @@ Make sure there is a virtio-net NIC attached.~%")
   (format t "Testing internet connectivity.~%")
   (format t "Attempting to resolve google.com... ")
   (finish-output)
-  (let ((goog (sys.net::resolve-address "google.com" nil)))
+  (let ((goog (mezzano.network::resolve-address "google.com" nil)))
     (cond (goog
            (format t "OK!~%")
            (format t "Has address ~A.~%" goog))
@@ -79,13 +110,91 @@ Make sure there is a virtio-net NIC attached.~%")
 (sys.int::cal "sys:source;file;local.lisp")
 (eval (read-from-string "(mezzano.file-system.local:add-local-file-host :local)"))
 
+;; ASDF.
+(sys.int::cal "sys:home;asdf;build;asdf.lisp")
+
+(defun home-source-registry ()
+  `(:source-registry
+    (:tree ,(user-homedir-pathname))
+    :inherit-configuration))
+(eval (read-from-string "(push 'home-source-registry asdf:*default-source-registries*)"))
+
+(defun driver-source-registry ()
+  `(:SOURCE-REGISTRY
+    (:TREE ,(pathname "SYS:SOURCE;DRIVERS;"))
+    (:TREE ,(pathname "SYS:SOURCE;GUI;VIRGL;"))
+    :INHERIT-CONFIGURATION))
+(eval (read-from-string "(push 'driver-source-registry asdf:*default-source-registries*)"))
+
+;; Sound driver.
+(sys.int::cal "sys:source;drivers;sound.lisp")
+#+x86-64
+(sys.int::cal "sys:source;drivers;intel-hda.lisp")
+
+;; Split-sequence
+(require :split-sequence)
+
+;; A bunch of GUI related systems.
+(require :zpb-ttf)
+(require :cl-vectors)
+(require :cl-paths-ttf)
+;; TCE is required for Chipz's decompressor.
+(let ((mezzano.compiler::*perform-tce* t)
+      ;; Prevent extremely excessive inlining.
+      (mezzano.compiler::*constprop-lambda-copy-limit* -1)
+      ;; This inhibits TCE when enabled.
+      (mezzano.compiler::*verify-special-stack* nil))
+  (require :chipz))
+(require :png-read)
+(require :cl-jpeg)
+(require :skippy)
+(require :cl-video)
+(require :cl-video-avi)
+(require :cl-video-gif)
+(require :cl-video-wav)
+(require :cl-wav)
+;; Swank doesn't really support logical pathname shenanigans.
+
+(load (merge-pathnames (make-pathname :directory '(:relative "slime") :name "swank-loader" :type "lisp")
+                       (user-homedir-pathname)))
+(eval (read-from-string "(swank-loader::init)"))
+(eval (read-from-string "(swank:create-server :style :spawn :dont-close t :interface \"0.0.0.0\")"))
+
+;; And the GUI.
+(sys.int::cal "sys:source;gui;package.lisp")
+(sys.int::cal "sys:source;gui;colour.lisp")
+(sys.int::cal "sys:source;gui;surface.lisp")
+(sys.int::cal "sys:source;gui;blit.lisp")
+#+x86-64
+(sys.int::cal "sys:source;gui;blit-x86-64-simd.lisp")
+#+arm64
+(sys.int::cal "sys:source;gui;blit-generic.lisp")
+(sys.int::cal "sys:source;gui;keymaps.lisp")
+(sys.int::cal "sys:source;gui;theme.lisp")
+(sys.int::cal "sys:source;gui;compositor.lisp")
+#+x86-64
+(sys.int::cal "sys:source;gui;input-drivers.lisp")
+#+arm64
+(sys.int::cal "sys:source;gui;input-drivers-virtio.lisp")
+#+x86-64
+(sys.int::cal "sys:source;gui;virtualbox-guest-helper.lisp")
+(sys.int::cal "sys:source;system;unifont.lisp")
+(sys.int::cal "sys:source;gui;basic-repl.lisp")
+(eval (read-from-string "(mezzano.gui.basic-repl:spawn)"))
+(sys.int::cal "sys:source;gui;font.lisp")
+(sys.int::cal "sys:source;gui;image.lisp")
+
 ;; Fonts. Loaded from the home directory.
 (ensure-directories-exist "LOCAL:>Fonts>")
-(dolist (f (directory (merge-pathnames "Fonts/**/*.ttf" (user-homedir-pathname))))
+(dolist (f (directory (merge-pathnames
+                       (make-pathname :directory '(:relative "Fonts" :wild-inferiors) :name :wild :type "ttf")
+                       (user-homedir-pathname))))
   (sys.int::copy-file f
              (merge-pathnames "LOCAL:>Fonts>" f)
              '(unsigned-byte 8)))
-(sys.int::copy-file (merge-pathnames "Fonts/LICENSE" (user-homedir-pathname))
+(sys.int::copy-file (merge-pathnames
+                     (make-pathname :directory '(:relative "Fonts") :name "LICENSE")
+                     (user-homedir-pathname))
                     "LOCAL:>Fonts>LICENSE"
                     'character)
 
@@ -96,53 +205,13 @@ Make sure there is a virtio-net NIC attached.~%")
                       (merge-pathnames "LOCAL:>Icons>" f)
                       '(unsigned-byte 8)))
 
-;; Other stuff.
-;; The desktop image, this can be removed or replaced.
-;; If it is removed, then the line below that starts the desktop must be updated.
-(sys.int::copy-file (merge-pathnames "Ducks.jpg" (user-homedir-pathname))
-                    "LOCAL:>Desktop.jpeg"
-                    '(unsigned-byte 8))
-
-;; ASDF.
-(sys.int::cal (merge-pathnames "asdf/asdf.lisp" (user-homedir-pathname)))
-(defun home-source-registry ()
-  `(:source-registry
-    (:tree ,(user-homedir-pathname))
-    :inherit-configuration))
-(eval (read-from-string "(push 'home-source-registry asdf:*default-source-registries*)"))
-
-;; A bunch of GUI related systems.
-(require :zpb-ttf)
-(require :cl-vectors)
-(require :cl-paths-ttf)
-;; TCE is required for Chipz's decompressor.
-(let ((sys.c::*perform-tce* t)
-      ;; Prevent extremely excessive inlining.
-      (sys.c::*constprop-lambda-copy-limit* -1)
-      ;; This inhibits TCE when enabled.
-      (sys.c::*verify-special-stack* nil))
-  (require :chipz))
-(require :png-read)
-(require :cl-jpeg)
-(require :skippy)
-(require :cl-video)
-(require :cl-video-avi)
-(require :cl-video-gif)
-(require :cl-video-wav)
-(require :cl-wav)
-(require :swank)
-(eval (read-from-string "(swank:create-server :style :spawn :dont-close t)"))
-
-;; And the GUI.
-(sys.int::cal "sys:source;gui;font.lisp")
-(sys.int::cal "sys:source;gui;image.lisp")
-
 ;: Mouse cursors.
 (flet ((load-cursor (path name &optional (hot-x 0) (hot-y 0))
          (let ((surf (funcall (read-from-string "mezzano.gui.image:load-image")
                               (merge-pathnames path "LOCAL:>Icons>"))))
-           (mezzano.gui.compositor:register-mouse-cursor
-            (mezzano.gui.compositor:make-mouse-cursor surf :hot-x hot-x :hot-y hot-y)
+           (funcall (read-from-string "mezzano.gui.compositor:register-mouse-cursor")
+            (funcall (read-from-string "mezzano.gui.compositor:make-mouse-cursor")
+                     surf :hot-x hot-x :hot-y hot-y)
             name))))
   (load-cursor "cursor-upleft.png"    :arrow-up-left     0   0)
   (load-cursor "cursor-upright.png"   :arrow-up-right    15  0)
@@ -157,12 +226,15 @@ Make sure there is a virtio-net NIC attached.~%")
 (sys.int::cal "sys:source;gui;widgets.lisp")
 (sys.int::cal "sys:source;line-edit-mixin.lisp")
 (sys.int::cal "sys:source;gui;popup-io-stream.lisp")
+;;(eval (read-from-string "(setf (sys.int::symbol-global-value '*terminal-io*) (make-instance 'mezzano.gui.popup-io-stream:lazy-popup-io-stream))"))
 (sys.int::cal "sys:source;gui;xterm.lisp")
 (sys.int::cal "sys:source;applications;telnet.lisp")
 (sys.int::cal "sys:source;applications;mandelbrot.lisp")
 (sys.int::cal "sys:source;applications;irc.lisp")
 (require :med)
 (sys.int::cal "sys:source;applications;peek.lisp")
+(sys.int::cal "sys:source;applications;spy.lisp")
+(sys.int::cal "sys:source;applications;settings.lisp")
 (sys.int::cal "sys:source;applications;fancy-repl.lisp")
 (sys.int::cal "sys:source;gui;desktop.lisp")
 (sys.int::cal "sys:source;gui;image-viewer.lisp")
@@ -170,14 +242,33 @@ Make sure there is a virtio-net NIC attached.~%")
 (sys.int::cal "sys:source;gui;music-player.lisp")
 (sys.int::cal "sys:source;applications;filer.lisp")
 (sys.int::cal "sys:source;applications;memory-monitor.lisp")
+(sys.int::cal "sys:source;gui;starfield.lisp")
+;;(eval (read-from-string "(setf mezzano.gui.compositor:*screensaver-spawn-function* 'mezzano.gui.starfield:spawn)"))
+
+;; USB Driver
+(require :mezzano-usb)
+(require :mezzano-usb/class-drivers)
+(require :mezzano-usb/ohci)
+(require :mezzano-usb/ehci)
+
+;; Other stuff.
+(sys.int::cal "sys:source;drivers;intel-gma.lisp")
+(sys.int::cal "sys:source;file;ext4.lisp")
 (sys.int::cal "sys:source;file;http.lisp")
-;; If the desktop image was removed above, then remove the :IMAGE argument
-;; from here.
+(sys.int::cal "sys:source;net;http-demo.lisp")
+(sys.int::cal "sys:source;system;disassemble.lisp")
+(sys.int::cal "sys:source;system;lldb.lisp")
+
+;; Load the desktop image and start the desktop.
+(sys.int::copy-file (merge-pathnames "common-raven-in-snow--canadian-rockies.jpg" (user-homedir-pathname))
+                    "LOCAL:>Desktop.jpeg"
+                    '(unsigned-byte 8))
 (defvar sys.int::*desktop* (eval (read-from-string "(mezzano.gui.desktop:spawn :image \"LOCAL:>Desktop.jpeg\")")))
 
 (defvar sys.int::*init-file-path* "SYS:HOME;INIT.LISP")
 
 (defun sys.int::load-init-file ()
+  (sleep 0.5) ; give the network a little time to settle.
   (when (and (boundp 'sys.int::*init-file-path*)
              sys.int::*init-file-path*)
     (handler-case (load sys.int::*init-file-path*)
@@ -188,5 +279,8 @@ Make sure there is a virtio-net NIC attached.~%")
 
 (mezzano.supervisor:add-boot-hook 'sys.int::load-init-file :late)
 (sys.int::load-init-file)
+
+;; Ditch the debugger hook that was established earlier.
+(setf mezzano.debug:*global-debugger* nil)
 
 ;; Done.

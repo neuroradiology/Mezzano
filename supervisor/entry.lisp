@@ -1,55 +1,9 @@
-;;;; Copyright (c) 2011-2017 Henry Harrington <henry.harrington@gmail.com>
-;;;; This code is licensed under the MIT license.
+;;;; Main entry point for the supervisor from the bootloader
 
 (in-package :mezzano.supervisor)
 
 ;;; FIXME: Should not be here.
 ;;; >>>>>>
-
-(defstruct (stack
-             (:constructor %make-stack (base size))
-             (:area :wired))
-  base
-  size)
-
-(defun %allocate-stack-1 (aligned-size bump-sym)
-  (mezzano.supervisor:without-footholds
-    (mezzano.supervisor:with-mutex (mezzano.runtime::*allocator-lock*)
-      (prog1 (logior (+ (symbol-value bump-sym) #x200000) ; + 2MB for guard page
-                     (ash sys.int::+address-tag-stack+ sys.int::+address-tag-shift+))
-        (incf (symbol-value bump-sym) aligned-size)))))
-
-;; TODO: Actually allocate virtual memory.
-(defun %allocate-stack (size &optional wired)
-  (declare (sys.c::closure-allocation :wired))
-  ;; 4k align the size.
-  (setf size (logand (+ size #xFFF) (lognot #xFFF)))
-  ;; 2m align the memory region.
-  (let* ((addr (%allocate-stack-1 (align-up size #x200000)
-                                  (if wired
-                                      'sys.int::*wired-stack-area-bump*
-                                      'sys.int::*stack-area-bump*)))
-         (stack (%make-stack addr size)))
-    ;; Allocate blocks.
-    (loop
-       for i from 0 do
-         (when (allocate-memory-range addr size
-                                      (logior sys.int::+block-map-present+
-                                              sys.int::+block-map-writable+
-                                              sys.int::+block-map-zero-fill+
-                                              (if wired
-                                                  sys.int::+block-map-wired+
-                                                  0)))
-           (return))
-         (when (> i mezzano.runtime::*maximum-allocation-attempts*)
-           (error 'storage-condition))
-         (debug-print-line "No memory for stack, calling GC.")
-         (sys.int::gc))
-    (sys.int::make-weak-pointer stack stack
-                                (lambda ()
-                                  (release-memory-range addr size))
-                                :wired)
-    stack))
 
 (defun reboot ()
   ;; FIXME: Need to sync disks and wait until snapshotting finishes.
@@ -91,6 +45,7 @@
 (defconstant +boot-option-freestanding+ #x02)
 (defconstant +boot-option-video-console+ #x04)
 (defconstant +boot-option-no-detect+ #x08)
+(defconstant +boot-option-no-smp+ #x10)
 
 (defun boot-uuid (offset)
   (check-type offset (integer 0 15))
@@ -164,7 +119,10 @@
      ;; Sleep til next boot.
      (%run-on-wired-stack-without-interrupts (sp fp)
       (let ((self (current-thread)))
-        (decf *snapshot-inhibit*)
+        ;; *SNAPSHOT-INHIBIT* is set to 1 during boot, decrement it
+        ;; and enable snapshotting now that all boot work has been done.
+        (sys.int::%atomic-fixnum-add-symbol '*snapshot-inhibit* -1)
+        (acquire-global-thread-lock)
         (setf (thread-wait-item self) "Next boot"
               (thread-state self) :sleeping)
         (%reschedule-via-wired-stack sp fp)))))
@@ -173,37 +131,41 @@
   (let ((first-run-p nil))
     (initialize-boot-cpu)
     (initialize-debug-log)
+    (initialize-fdt boot-information-page)
     (initialize-platform-early-console boot-information-page)
     (initialize-initial-thread)
     (setf *boot-information-page* boot-information-page
           *cold-unread-char* nil
           mezzano.runtime::*paranoid-allocation* nil
           *deferred-boot-actions* '()
-          *paging-disk* nil
-          *page-fault-hook* nil)
+          *paging-disk* nil)
     (initialize-physical-allocator)
     (initialize-early-video)
-    (when (boot-option +boot-option-video-console+)
-      (debug-set-output-pseudostream #'debug-video-stream))
     (when (not (boundp 'mezzano.runtime::*active-catch-handlers*))
       (setf first-run-p t)
       (mezzano.runtime::first-run-initialize-allocator)
       ;; FIXME: Should be done by cold generator
       (setf mezzano.runtime::*active-catch-handlers* 'nil
             *pseudo-atomic* nil
-            sys.int::*known-finalizers* nil))
-    (setf *boot-id* (sys.int::cons-in-area nil nil :wired))
+            sys.int::*known-finalizers* nil
+            *big-wait-for-objects-lock* (place-spinlock-initializer)))
     (initialize-early-platform)
+    (when (boundp '*boot-id*)
+      (setf (event-state *boot-id*) t))
+    (setf *boot-id* (make-event :name 'boot-epoch))
     (initialize-threads)
+    (initialize-sync first-run-p)
     (initialize-disk)
     (initialize-pager)
     (initialize-snapshot)
     (%enable-interrupts)
     ;;(debug-set-output-pseudostream #'debug-video-stream)
     ;;(debug-set-output-pseudostream (lambda (op &optional arg) (declare (ignore op arg))))
-    (debug-write-line "Hello, Debug World!")
+    (debug-print-line "Hello, Debug World!")
     (initialize-time)
     (initialize-video)
+    (when (boot-option +boot-option-video-console+)
+      (debug-set-output-pseudostream #'debug-video-stream))
     (initialize-efi)
     (initialize-acpi)
     (initialize-virtio)
@@ -212,6 +174,8 @@
     (when (not (boot-option +boot-option-no-detect+))
       (detect-disk-partitions))
     (initialize-paging-system)
+    (when (not (boot-option +boot-option-no-smp+))
+      (boot-secondary-cpus))
     (cond (first-run-p
            (setf *post-boot-worker-thread* (make-thread #'post-boot-worker :name "Post-boot worker thread")
                  *boot-hook-lock* (make-mutex "Boot Hook Lock")

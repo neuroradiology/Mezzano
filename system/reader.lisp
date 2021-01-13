@@ -1,7 +1,6 @@
-;;;; Copyright (c) 2011-2016 Henry Harrington <henry.harrington@gmail.com>
-;;;; This code is licensed under the MIT license.
+;;;; READ
 
-(in-package :sys.int)
+(in-package :mezzano.internals)
 
 (defvar *read-base* 10 "The current input base.")
 (defvar *read-eval* t "Controls the #. reader macro.")
@@ -9,16 +8,20 @@
 (defvar *read-suppress* nil)
 
 (defvar *read-lookahead-table*)
+(defvar *read-package* nil)
 
 (declaim (special *readtable* *standard-readtable*)
-         (type readtable *readtable* *standard-readtable*))
+         ;; Disabled due to issues with cross-compiled structures.
+         #++(type readtable *readtable* *standard-readtable*))
 
 (defstruct (readtable
              (:predicate readtablep)
-             (:copier))
+             (:copier nil))
   (case :upcase :type (member :upcase :downcase :preserve :invert))
   (base-characters (make-array 256 :initial-element nil) :type (simple-vector 256))
-  (extended-characters (make-hash-table) :type hash-table))
+  ;; Full synchronization. Readtables can be modified from any thread.
+  ;; FIXME: A full lock around the readtable would be better.
+  (extended-characters (make-hash-table :synchronized t) :type hash-table))
 
 ;;; TODO: At some point the init code must copy the standard readtable to create
 ;;; the initial readtable.
@@ -38,7 +41,7 @@
     (set-syntax-from-char (code-char i) (code-char i) to-readtable from-readtable))
   (clrhash (readtable-extended-characters to-readtable))
   (maphash (lambda (k v)
-             (declare (ignore))
+             (declare (ignore v))
              (set-syntax-from-char k k to-readtable from-readtable))
            (readtable-extended-characters from-readtable))
   to-readtable)
@@ -77,7 +80,7 @@
     (cerror "Carry on!" "This would modify the standard readtable."))
   (if new-function
       (setf (readtable-syntax-type char readtable)
-            (list new-function (not non-terminating-p)))
+            (list new-function (not (not non-terminating-p))))
       (setf (readtable-syntax-type char readtable) nil))
   t)
 
@@ -85,9 +88,9 @@
   (when (and (null readtable) *protect-the-standard-readtable*)
     (cerror "Carry on!" "This would modify the standard readtable."))
   (setf (readtable-syntax-type char readtable)
-        (list 'read-dispatch-char (not non-terminating-p)
+        (list 'read-dispatch-char (not (not non-terminating-p))
               (make-array 256 :initial-element nil)
-              (make-hash-table)))
+              (make-hash-table :synchronized t)))
   t)
 
 (defun get-dispatch-macro-character (disp-char sub-char &optional (readtable *readtable*))
@@ -121,7 +124,7 @@
            (setf (readtable-syntax-type to-char to-readtable) data))
           ((= (length data) 4)
            ;; Dispatching character, must copy the dispatch tables.
-           (let ((ht (make-hash-table)))
+           (let ((ht (make-hash-table :synchronized t)))
              (maphash (lambda (k v) (setf (gethash k ht) v)) (fourth data))
              (setf (readtable-syntax-type to-char to-readtable)
                    (list (first data) (second data)
@@ -140,14 +143,6 @@
     (:invert (if (upper-case-p c)
                  (char-downcase c)
                  (char-upcase c)))))
-
-(defun follow-stream-designator (stream default)
-  (cond ((null stream) default)
-        ((eql stream 't) *terminal-io*)
-        ((streamp stream) stream)
-        (t (error 'type-error
-                  :expected-type '(or stream null (eql t))
-                  :datum stream))))
 
 (defun whitespace[2]p (char &optional (readtable *readtable*))
   "Test if CHAR is a whitespace[2] character under READTABLE."
@@ -173,10 +168,9 @@
   (eql char #\-))
 
 (defun terminating-macro-p (char &optional (readtable *readtable*))
-  (multiple-value-bind (fn terminatingp)
+  (multiple-value-bind (fn non-terminating-p)
       (get-macro-character char readtable)
-    (declare (ignore fn))
-    terminatingp))
+    (and fn (not non-terminating-p))))
 
 (defun read-token (stream first)
   "Read a normal Lisp token from STREAM with FIRST as the initial character."
@@ -198,8 +192,8 @@
                ;; is seen. Treat single escape characters as above.
                (do ((y (read-char stream t nil t)
                        (read-char stream t nil t)))
-                   ((multiple-escape-p y))
-                 (when (single-escape-p y)
+                   ((eql (readtable-syntax-type y) :multiple-escape))
+                 (when (eql (readtable-syntax-type y) :single-escape)
                    (read-char stream t nil t)))))))
     (return-from read-token nil))
   ;; Normal read code, without *READ-SUPPRESS* enabled
@@ -255,7 +249,10 @@
                            token (make-array 16
                                              :element-type 'character
                                              :adjustable t
-                                             :fill-pointer 0)))))
+                                             :fill-pointer 0))))
+               ;; Reset seen-escape here, done reading the package
+               ;; half of the token, on to the symbol name.
+               (setf seen-escape nil))
               (t (vector-push-extend (case-correct x) token)))))
     ;; Check for invalid uses of the dot. Tokens that are constructed
     ;; entirely from dots are invalid unless one or more of the dots was
@@ -271,6 +268,15 @@
         (when (eql (char token offset) #\.)
           (incf dot-count))))
     (cond
+      ;; If no escapes were seen, a double-package marker was seen,
+      ;; and the symbol name is empty then we're reading SBCL's
+      ;; extended package prefix syntax.
+      ((and (not seen-escape)
+            package-name
+            intern-symbol
+            (zerop (length token)))
+       (let ((*read-package* (find-package-or-die package-name)))
+         (read stream t nil t)))
       ;; Return a symbol immediately if a package marker was seen.
       (package-name
        (if (or intern-symbol (string= "KEYWORD" package-name))
@@ -284,14 +290,14 @@
       ;; If an escape character was seen, then do not try to parse the token as
       ;; an number, intern it and return it immediately.
       (seen-escape
-       (intern token))
+       (intern token *read-package*))
       ;; Attempt to parse a number.
       (t (or (read-integer token)
              (read-float token)
-             (read-ratio token)
-             (intern token))))))
+             (read-ratio token stream)
+             (intern token *read-package*))))))
 
-(defun read-ratio (string)
+(defun read-ratio (string stream)
   ;; ratio = sign? digits+ slash digits+
   (let ((numerator nil)
         (denominator nil)
@@ -341,13 +347,19 @@
            (return-from read-ratio))
          (setf denominator (+ (* denominator *read-base*)
                               weight))))
-    (/ numerator denominator)))
+    (when (zerop denominator)
+      (error 'simple-reader-error :stream stream
+             :format-control "Invalid ratio, dividing by zero: ~A"
+             :format-arguments (list string)))
+    (if negativep
+        (- (/ numerator denominator))
+        (/ numerator denominator))))
 
 (defvar *exponent-markers* "DdEeFfLlSs")
 (defvar *decimal-digits* "0123456789")
 
 (defun read-float (string)
-  ;; float    = sign? decimal-digit* decimal-point decimal-digit+
+  ;; float    = sign? decimal-digit* decimal-point decimal-digit+ [exponent]
   ;;          = sign? decimal-digit+ [decimal-point decimal-digit*] exponent
   ;; exponent = exponent-marker [sign] decimal-digit+
   ;; exponent-marker = d | D | e | E | f | F | l | L | s | S
@@ -390,9 +402,10 @@
         ;; If there was an integer part, then the next character
         ;; must be either a decimal-digit or an exponent marker.
         ;; If there was no integer part, it must be a decimal-digit.
-        (when (and (not (or (not saw-integer-digits)
-                            (find (peek) *exponent-markers*)))
-                   (not (find (peek) *decimal-digits*)))
+        (when (not (if saw-integer-digits
+                       (or (find (peek) *exponent-markers*)
+                           (find (peek) *decimal-digits*))
+                       (find (peek) *decimal-digits*)))
           (return-from read-float))
         ;; Accumulate decimal digits.
         (let ((first-decimal position))
@@ -413,9 +426,10 @@
                (setf exponent-sign -1))
           (#\+ (consume)))
         ;; Must be at least one digit in the exponent
-        ;; and one digit in the integer part
+        ;; and either one digit in the integer part or a decimal point.
         (when (or (not (find (peek) *decimal-digits*))
-                  (not saw-integer-digits))
+                  (not (or saw-integer-digits
+                           saw-decimal-point)))
           (return-from read-float))
         ;; Read exponent part.
         (loop (when (not (find (peek) *decimal-digits*))
@@ -493,45 +507,53 @@
         ((and (eql x #\.)
               (not *read-suppress*))
          ;; Reading a potentially dotted list
-         ;; Read the dot and drop it
-         (read-char stream t nil t)
-         (let ((y (peek-char nil stream t nil t)))
-           (when (or (terminating-macro-p y) (whitespace[2]p y))
-             (let ((final (read stream t nil t)))
-               (when (eql list tail)
-                 (error 'simple-reader-error :stream stream
-                        :format-control "No forms before dot in dotted list."
-                        :format-arguments '()))
-               (unless (char= (peek-char t stream t nil t) #\))
-                 (error 'simple-reader-error :stream stream
-                        :format-control "Too many elements after dot in dotted list."
-                        :format-arguments '()))
-               (read-char stream t nil t)
-               (setf (cdr tail) final)
-               (return (if *read-suppress* nil (cdr list))))))
-         ;; Oops, it wasn't a dotted list and we can't unread
-         ;; the dot because of the peek-char call
-         ;; Manually dispatch to the next reader function
-         (let ((value (multiple-value-list
-                       (funcall (or (get-macro-character x)
-                                    #'read-token)
-                                stream x))))
-           (when value
-             (setf (cdr tail) (cons (car value) nil))
-             (setf tail (cdr tail)))))
-        (t (let* ((c (read-char stream t nil t))
-                  (value (multiple-value-list (funcall (or (get-macro-character c)
-                                                           #'read-token)
-                                                       stream
-                                                       c))))
+         ;; Locations for the oops case below.
+         (let ((start-loc (location-tracking-stream-location stream)))
+           ;; Read the dot and drop it
+           (read-char stream t nil t)
+           (let ((y (peek-char nil stream t nil t)))
+             (when (or (terminating-macro-p y) (whitespace[2]p y))
+               (let ((final (read stream t nil t)))
+                 (when (eql list tail)
+                   (error 'simple-reader-error :stream stream
+                          :format-control "No forms before dot in dotted list."
+                          :format-arguments '()))
+                 (unless (char= (peek-char t stream t nil t) #\))
+                   (error 'simple-reader-error :stream stream
+                          :format-control "Too many elements after dot in dotted list."
+                          :format-arguments '()))
+                 (read-char stream t nil t)
+                 (setf (cdr tail) final)
+                 (return (if *read-suppress* nil (cdr list))))))
+           ;; Oops, it wasn't a dotted list and we can't unread
+           ;; the dot because of the peek-char call
+           ;; Manually dispatch to the next reader function
+           (let ((value (multiple-value-list
+                         (funcall (or (get-macro-character x)
+                                      #'read-token)
+                                  stream x))))
              (when value
-               (setf (cdr value) nil
-                     (cdr tail) value
-                     tail value))))))))
+               (let ((end-loc (location-tracking-stream-location stream))
+                     (elt (cons (first value) nil)))
+                 (set-reader-element-location elt start-loc end-loc)
+                 (setf (cdr tail) elt
+                       tail (cdr tail)))))))
+        (t
+         (let* ((start-loc (location-tracking-stream-location stream))
+                (c (read-char stream t nil t))
+                (value (multiple-value-list (funcall (or (get-macro-character c)
+                                                         #'read-token)
+                                                     stream
+                                                     c))))
+           (when value
+             (let ((end-loc (location-tracking-stream-location stream))
+                   (elt (cons (first value) nil)))
+               (set-reader-element-location elt start-loc end-loc)
+               (setf (cdr tail) elt
+                     tail (cdr tail))))))))))
 
 (defun read-right-parenthesis (stream first)
   "Signals a reader-error when an unexpected #\) is seen."
-  (declare (ignore stream))
   (error 'simple-reader-error :stream stream
          :format-control "Unexpected ~S."
          :format-arguments (list first)))
@@ -564,19 +586,29 @@
         (vector-push-extend (read-char stream t nil t) string)
         (vector-push-extend x string))))
 
+(defvar *backquote-depth* 0)
+
 (defun read-backquote (stream first)
   (declare (ignore first))
-  (list 'backquote (read stream t nil t)))
+  (list 'backquote
+        (let ((*backquote-depth* (1+ *backquote-depth*)))
+          (read stream t nil t))))
 
 (defun read-comma (stream first)
   (declare (ignore first))
-  (case (peek-char nil stream t)
-    (#\@ (read-char stream t nil t)
-         (list 'bq-comma-atsign (read stream t nil t)))
-    (#\. (read-char stream t nil t)
-         (list 'bq-comma-dot (read stream t nil t)))
-    (otherwise
-     (list 'bq-comma (read stream t nil t)))))
+  (when (zerop *backquote-depth*)
+    (error 'simple-reader-error
+           :stream stream
+           :format-control "Comma not inside a backquote"
+           :format-arguments '()))
+  (let ((*backquote-depth* (1- *backquote-depth*)))
+    (case (peek-char nil stream t)
+      (#\@ (read-char stream t nil t)
+           (list 'bq-comma-atsign (read stream t nil t)))
+      (#\. (read-char stream t nil t)
+           (list 'bq-comma-dot (read stream t nil t)))
+      (otherwise
+       (list 'bq-comma (read stream t nil t))))))
 
 (defun read-dispatch-char (stream first)
   "Dispatch to a dispatching macro character."
@@ -611,11 +643,17 @@
             (case ch
               (#\0 (vector-push-extend 0 bits))
               (#\1 (vector-push-extend 1 bits))
-              (t (error "Invalid character ~S in #*." ch)))))
+              (t (error 'simple-reader-error :stream stream
+                        :format-control "Invalid character ~S in #*."
+                        :format-arguments (list ch))))))
     (when (and p (not (zerop p)) (zerop (length bits)))
-      (error "Need at least one bit for #* with an explicit length."))
+      (error 'simple-reader-error :stream stream
+             :format-control "Need at least one bit for #* with an explicit length."
+             :format-arguments '()))
     (when (and p (> (length bits) p))
-      (error "Too many bits."))
+      (error 'simple-reader-error :stream stream
+             :format-control "Too many bits."
+             :format-arguments '()))
     (let ((final-array (make-array (or p (length bits))
                                    :element-type 'bit)))
       (unless (zerop (length final-array))
@@ -646,14 +684,14 @@
                    (when (or (get-macro-character z) (whitespace[2]p z))
                      (unread-char z stream)
                      t)))
-            (let ((syntax (readtable-syntax-type x)))
+            (let ((syntax (readtable-syntax-type z)))
               (cond ((eql syntax :single-escape)
                      (vector-push-extend (read-char stream t nil t) token))
                     ((eql syntax :multiple-escape)
                      (do ((y (read-char stream t nil t)
                              (read-char stream t nil t)))
-                         ((multiple-escape-p y))
-                       (if (single-escape-p y)
+                         ((eql (readtable-syntax-type y) :multiple-escape))
+                       (if (eql (readtable-syntax-type y) :single-escape)
                            (vector-push-extend (read-char stream t nil t) token)
                            (vector-push-extend y token))))
                     (t (vector-push-extend (case-correct z) token)))))
@@ -684,13 +722,14 @@
 
 (defun read-#-dot (stream ch p)
   (ignore-#-argument ch p)
-  (cond (*read-suppress*
-         (read stream t nil t))
-        (*read-eval*
-         (eval (read stream t nil t)))
-        (t (error 'simple-reader-error :stream stream
-                  :format-control "Cannot #. when *READ-EVAL* is false."
-                  :format-arguments '()))))
+  (let ((*backquote-depth* 0))
+    (cond (*read-suppress*
+           (read stream t nil t))
+          (*read-eval*
+           (eval (read stream t nil t)))
+          (t (error 'simple-reader-error :stream stream
+                    :format-control "Cannot #. when *READ-EVAL* is false."
+                    :format-arguments '())))))
 
 (defun read-#-radix (stream ch p)
   "Read a number in the specified radix."
@@ -713,9 +752,17 @@
       (the rational (read stream t nil t)))))
 
 (defun read-#-left-parenthesis (stream ch p)
-  (let ((foo (read-left-parenthesis stream #\()))
+  (declare (ignore ch))
+  (let* ((foo (read-left-parenthesis stream #\())
+         (len (length foo)))
     (unless *read-suppress*
-      (apply #'vector foo))))
+      (when p
+        (cond ((> len p)
+               (error "Too many elements to initialize an array of length ~D." p))
+              ((< len p)
+               (error "Not implemented, too few elements to initialize an array of length ~D." p))))
+      (make-array len
+                  :initial-contents foo))))
 
 (defun read-#-complex (stream ch p)
   "Read a complex number."
@@ -726,8 +773,11 @@
   (let ((number (read stream t nil t)))
     (when (or (not (listp number))
               (/= (length number) 2)
-              (not (realp (car number)))
-              (not (realp (cadr number))))
+              ;; TODO: Clean this up, cross compiler hack.
+              (not (or (short-float-p (first number))
+                       (realp (first number))))
+              (not (or (short-float-p (second number))
+                       (realp (second number)))))
       (error "Invalid complex number ~S" number))
     (complex (first number) (second number))))
 
@@ -746,6 +796,36 @@
         (when (zerop len) (return))
         (setf current-dim (elt current-dim 0))))
     (make-array dimensions :initial-contents object)))
+
+(defun read-#-struct (stream ch p)
+  (declare (notinline slot-value make-instance)) ; bootstrap hack
+  (ignore-#-argument ch p)
+  (cond (*read-suppress*
+         (read stream t nil t)
+         nil)
+        (*read-eval*
+         (let* ((form (read stream t nil t))
+                (structure-name (first form))
+                (class (find-class structure-name nil)))
+           (when (or (not class)
+                     (not (typep class 'structure-class)))
+             (error 'simple-reader-error :stream stream
+                    :format-control "~S does not name a structure class"
+                    :format-arguments (list structure-name)))
+           (when (not (slot-value class 'mezzano.clos::has-standard-constructor))
+             (error 'simple-reader-error :stream stream
+                    :format-control "Structure class ~S does not have a standard constructor"
+                    :format-arguments (list structure-name)))
+           (apply #'make-instance class
+                  ;; Convert slot names to keywords.
+                  (loop
+                     for (slot value) on (rest form) by #'cddr
+                     collect (intern (string slot) (find-package 'keyword))
+                     collect value))))
+        ;; The #S syntax is equivalent to #., so presumably obeys *READ-EVAL*.
+        (t (error 'simple-reader-error :stream stream
+                  :format-control "Cannot #S when *READ-EVAL* is false."
+                  :format-arguments '()))))
 
 (defun read-#-pathname (stream ch p)
   (ignore-#-argument ch p)
@@ -772,7 +852,8 @@
 
 (defun read-#-features (stream suppress-if-false)
   "Common function to implement #+ and #-."
-  (let* ((test (let ((*package* (find-package "KEYWORD")))
+  (let* ((test (let* ((*package* (find-package "KEYWORD"))
+                      (*read-package* *package*))
                  (read stream t nil t)))
          (*read-suppress* (or *read-suppress*
                               (if suppress-if-false
@@ -809,19 +890,29 @@
 
 (defun read-#-invalid (stream ch p)
   "Handle explicitly invalid # dispatch characters."
-  (declare (ignore stream p))
+  (declare (ignore p))
   (error 'simple-reader-error :stream stream
          :format-control "Illegal syntax #~A."
          :format-arguments (list ch)))
 
+(defstruct read-lookahead-proxy
+  (used-p nil))
+
 (defun read-#-equal-sign (stream ch p)
   (declare (ignore ch))
-  (let ((value (read stream t nil t)))
-    (cond (*read-suppress*
-           (values))
-          (t
-           (setf (gethash p *read-lookahead-table*) value)
-           value))))
+  (cond (*read-suppress*
+         (read stream t nil t)
+         (values))
+        (t
+         (let ((proxy (make-read-lookahead-proxy)))
+           (setf (gethash p *read-lookahead-table*) proxy)
+           (let ((value (read stream t nil t)))
+             (when (read-lookahead-proxy-used-p proxy)
+               (when (eql value proxy)
+                 (error "Tried to read nothing with #=."))
+               (read-lookahead-substitute value proxy))
+             (setf (gethash p *read-lookahead-table*) value)
+             value)))))
 
 (defun read-#-sharp-sign (stream ch p)
   (declare (ignore stream ch))
@@ -832,14 +923,20 @@
              (gethash p *read-lookahead-table*)
            (when (not existsp)
              (cerror "Read NIL" "Unknown read ## value ~D" p))
+           (when (read-lookahead-proxy-p value)
+             (setf (read-lookahead-proxy-used-p value) t))
            value))))
 
 (defun read-common (stream eof-error-p eof-value recursive-p)
   (let ((*read-lookahead-table* (if recursive-p
                                     *read-lookahead-table*
-                                    (make-hash-table))))
+                                    (make-hash-table)))
+        (*read-package* (or (and recursive-p
+                                 *read-package*)
+                            *package*)))
     ;; Skip leading whitespace.
-    (loop (let ((c (read-char stream eof-error-p 'nil t)))
+    (loop (let ((start-loc (location-tracking-stream-location stream))
+                (c (read-char stream eof-error-p 'nil t)))
             (when (eql c 'nil)
               (return eof-value))
             (when (invalidp c)
@@ -851,13 +948,15 @@
               ;; read subfunction.
               (let ((value (multiple-value-list (funcall (or (get-macro-character c)
                                                              #'read-token)
-                                                         stream c))))
+                                                         stream c)))
+                    (end-loc (location-tracking-stream-location stream)))
                 (when value
+                  (set-reader-form-location (first value) start-loc end-loc)
                   (return (first value)))))))))
 
 (defun read (&optional input-stream (eof-error-p t) eof-value recursive-p)
   "READ parses the printed representation of an object from STREAM and builds such an object."
-  (let ((stream (follow-stream-designator input-stream *standard-input*)))
+  (let ((stream (frob-input-stream input-stream)))
     (with-stream-editor (stream recursive-p)
       (let ((result (read-common stream
                                  eof-error-p
@@ -871,19 +970,10 @@
         result))))
 
 (defun read-preserving-whitespace (&optional input-stream (eof-error-p t) eof-value recursive-p)
-  (read-common (follow-stream-designator input-stream *standard-input*)
+  (read-common (frob-input-stream input-stream)
                eof-error-p
                eof-value
                recursive-p))
-
-(defun read-from-string (string &optional (eof-error-p t) eof-value &key (start 0) end preserve-whitespace)
-  (let (index)
-    (values
-     (with-input-from-string (stream string :start start :end end :index index)
-       (if preserve-whitespace
-           (read-preserving-whitespace stream eof-error-p eof-value)
-           (read stream eof-error-p eof-value)))
-     index)))
 
 (defmacro with-standard-io-syntax (&body body)
   `(%with-standard-io-syntax (lambda () (progn ,@body))))
@@ -967,7 +1057,10 @@
   (set-dispatch-macro-character #\# #\- 'read-#-minus readtable)
   (set-dispatch-macro-character #\# #\| 'read-#-vertical-bar readtable)
   (set-dispatch-macro-character #\# #\< 'read-#-invalid readtable)
+  (set-dispatch-macro-character #\# #\Backspace 'read-#-invalid readtable)
+  (set-dispatch-macro-character #\# #\Linefeed 'read-#-invalid readtable)
   (set-dispatch-macro-character #\# #\Newline 'read-#-invalid readtable)
+  (set-dispatch-macro-character #\# #\Return 'read-#-invalid readtable)
   (set-dispatch-macro-character #\# #\Space 'read-#-invalid readtable)
   (set-dispatch-macro-character #\# #\Tab 'read-#-invalid readtable)
   (set-dispatch-macro-character #\# #\Page 'read-#-invalid readtable)
@@ -977,3 +1070,57 @@
 (initialize-standard-readtable *standard-readtable*)
 (setf *protect-the-standard-readtable* t)
 (setf *readtable* (copy-readtable nil))
+
+(defmacro with-reader-location-tracking (&body body)
+  `(call-with-reader-location-tracking (lambda () ,@body)))
+
+(defvar *reader-element-locations* nil)
+(defvar *reader-form-locations* nil)
+
+(defun call-with-reader-location-tracking (thunk)
+  (let ((*reader-form-element-locations* (make-hash-table))
+        (*reader-form-locations* (make-hash-table)))
+    (funcall thunk)))
+
+(defun reader-form-location (form)
+  (and *reader-form-locations*
+       (gethash form *reader-form-locations*)))
+
+(defstruct source-location
+  ;; Namestring
+  file
+  top-level-form-number
+  ;; Raw file position.
+  position end-position
+  ;; Line number (from 1).
+  line end-line
+  ;; Character index (from 0).
+  character end-character)
+
+(defun combine-source-locations (start-location end-location)
+  (make-source-location
+   :file (source-location-file start-location)
+   :top-level-form-number (source-location-top-level-form-number start-location)
+   :position (source-location-position start-location)
+   :end-position (source-location-position end-location)
+   :line (source-location-line start-location)
+   :end-line (source-location-line end-location)
+   :character (source-location-character start-location)
+   :end-character (source-location-character end-location)))
+
+(defun set-reader-form-location (form start-location end-location)
+  (when (and start-location end-location
+             *reader-form-locations*)
+    (setf (gethash form *reader-form-locations*)
+          (combine-source-locations start-location end-location))))
+
+(defun reader-element-location (element)
+  (and *reader-element-locations*
+       (gethash element *reader-element-locations*)))
+
+(defun set-reader-element-location (element start-location end-location)
+  (when (and start-location end-location
+             *reader-element-locations*)
+    (set-reader-form-location (car element) start-location end-location)
+    (setf (gethash element *reader-element-locations*)
+          (combine-source-locations start-location end-location))))

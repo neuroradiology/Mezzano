@@ -1,5 +1,4 @@
-;;;; Copyright (c) 2015-2016 Henry Harrington <henry.harrington@gmail.com>
-;;;; This code is licensed under the MIT license.
+;;;; Basic ACPI table support
 
 (in-package :mezzano.supervisor)
 
@@ -166,10 +165,23 @@
 (defconstant +acpi-iapc-boot-arch-cmos-rtc-not-present+ #x0020)
 
 (defun acpi-parse-rsdp (rsdp-address)
-  (map-physical-memory (align-down rsdp-address +4k-page-size+)
-                       (align-up (1+ (logand rsdp-address #xFFF))
-                                 +4k-page-size+)
-                       "ACPI")
+  (map-physical-memory-early (align-down rsdp-address +4k-page-size+)
+                             (align-up (1+ (logand rsdp-address #xFFF))
+                                       +4k-page-size+)
+                             "ACPI")
+  ;; Check signature.
+  (loop
+     with sig = "RSD PTR "
+     for i below 8
+     for byte = (char-code (char sig i))
+     do
+       (when (not (eql (physical-memref-unsigned-byte-8 (+ rsdp-address +acpi-rsdp-signature-offset+) i) byte))
+         (debug-print-line "RSDP has invalid signature!")
+         (return-from acpi-parse-rsdp nil)))
+  ;; Check v1 checksum.
+  (unless (acpi-checksum-range rsdp-address 20)
+    (debug-print-line "RSDP failed v1.0 checksum!")
+    (return-from acpi-parse-rsdp nil))
   (let ((xsdt-address nil)
         (revision (physical-memref-unsigned-byte-8 (+ rsdp-address +acpi-rsdp-revision-offset+) 0)))
     (when (>= revision 2)
@@ -190,20 +202,20 @@
 (defun ensure-acpi-table-accessible (address)
   ;; Make sure that the length is mapped.
   (let ((length-end (+ address +acpi-header-length-offset+ 4)))
-    (map-physical-memory (align-down address +4k-page-size+)
-                         (- (align-up length-end +4k-page-size+)
-                            (align-down address +4k-page-size+))
-                         "ACPI")
+    (map-physical-memory-early (align-down address +4k-page-size+)
+                               (- (align-up length-end +4k-page-size+)
+                                  (align-down address +4k-page-size+))
+                               "ACPI")
     ;; Read length and map the entire table in.
     (let* ((length (physical-memref-unsigned-byte-32
                     (+ address
                        +acpi-header-length-offset+)
                     0))
            (end (+ address length)))
-      (map-physical-memory (align-down address +4k-page-size+)
-                         (- (align-up end +4k-page-size+)
-                            (align-down address +4k-page-size+))
-                         "ACPI"))))
+      (map-physical-memory-early (align-down address +4k-page-size+)
+                                 (- (align-up end +4k-page-size+)
+                                    (align-down address +4k-page-size+))
+                                 "ACPI"))))
 
 (defun acpi-read-generic-address-structure (address)
   (make-acpi-generic-address
@@ -318,6 +330,8 @@
       (dotimes (i n-entries)
         (setf (svref entries i) (physical-memref-unsigned-byte-64 (+ address +acpi-header-length+) i)))
       (values header entries))))
+
+(defconstant +acpi-madt-processor-lapic-flag-enabled+ 0)
 
 (defstruct (acpi-madt-processor-lapic
              (:area :wired))
@@ -450,11 +464,15 @@
       (debug-print-line "No ACPI RSDP.")
       (return-from initialize-acpi))
     (let ((rsdp (acpi-parse-rsdp rsdp-address)))
+      (when (not rsdp)
+        (debug-print-line "ACPI RSDP failed validation.")
+        (return-from initialize-acpi))
       (debug-print-line "RSDP: " (acpi-rsdp-oemid rsdp) " " (acpi-rsdp-revision rsdp) " " (acpi-rsdp-rsdt-address rsdp) " " (acpi-rsdp-xsdt-address rsdp))
       (multiple-value-bind (root-header table-addresses)
           (if (acpi-rsdp-xsdt-address rsdp)
               (read-acpi-xsdt (acpi-rsdp-xsdt-address rsdp))
               (read-acpi-rsdt (acpi-rsdp-rsdt-address rsdp)))
+        (declare (ignore root-header))
         (debug-print-line "Read " (sys.int::simple-vector-length table-addresses) " tables.")
         (let ((tables (sys.int::make-simple-vector (sys.int::simple-vector-length table-addresses)
                                                    :wired)))

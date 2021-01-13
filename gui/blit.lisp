@@ -1,14 +1,4 @@
-;;;; Copyright (c) 2011-2016 Henry Harrington <henry.harrington@gmail.com>
-;;;; This code is licensed under the MIT license.
-
-;;;; Optimized pluggable blitter functions.
-;;;; The low-level pixel blending functions use a custom calling
-;;;; convetion and must not be called directly from lisp.
-;;;; RAX contains the source pixel.
-;;;; R9 contains the destination simple UB32 vector.
-;;;; RDI contains the index of the destination pixel.
-;;;; RAX, RCX, RDX and MMX/SSE registers are caller save.
-;;;; All other registers are callee save.
+;;;; Optimized 2D array blitting and filling functions.
 
 (in-package :mezzano.gui)
 
@@ -47,23 +37,27 @@
     (multiple-value-bind (from-displaced-to from-displaced-offset)
         (array-displacement from-array)
       (when from-displaced-to
+        (when (integerp from-displaced-to)
+          (error "Memory arrays not supported"))
         (setf from-array from-displaced-to
               from-offset from-displaced-offset)))
     (multiple-value-bind (to-displaced-to to-displaced-offset)
         (array-displacement to-array)
       (when to-displaced-to
+        (when (integerp to-displaced-to)
+          (error "Memory arrays not supported"))
         (setf to-array to-displaced-to
               to-offset to-displaced-offset)))
     (incf from-offset (+ (* from-row from-width) from-col))
     (incf to-offset (+ (* to-row to-width) to-col))
     (values nrows ncols
-            (if (sys.int::%simple-1d-array-p from-array)
+            (if (mezzano.internals::%simple-1d-array-p from-array)
                 from-array
-                (sys.int::%complex-array-storage from-array))
+                (mezzano.internals::%complex-array-storage from-array))
             from-offset from-width
-            (if (sys.int::%simple-1d-array-p to-array)
+            (if (mezzano.internals::%simple-1d-array-p to-array)
                 to-array
-                (sys.int::%complex-array-storage to-array))
+                (mezzano.internals::%complex-array-storage to-array))
             to-offset to-width)))
 
 (defun compute-blit-info-dest (nrows ncols to-array to-row to-col)
@@ -87,13 +81,15 @@
     (multiple-value-bind (to-displaced-to to-displaced-offset)
         (array-displacement to-array)
       (when to-displaced-to
+        (when (integerp to-displaced-to)
+          (error "Memory arrays not supported"))
         (setf to-array to-displaced-to
               to-offset to-displaced-offset)))
     (incf to-offset (+ (* to-row to-width) to-col))
     (values nrows ncols
-            (if (sys.int::%simple-1d-array-p to-array)
+            (if (mezzano.internals::%simple-1d-array-p to-array)
                 to-array
-                (sys.int::%complex-array-storage to-array))
+                (mezzano.internals::%complex-array-storage to-array))
             to-offset to-width)))
 
 (declaim (inline simple-ub32-vector-p simple-ub8-vector-p simple-ub1-vector-p))
@@ -108,6 +104,8 @@
   (typep object '(simple-array (unsigned-byte 1) (*))))
 
 ;;; High-level functions.
+
+;;; FIXME: BITBLT has problems with overlapping copies.
 
 (defun 2d-array-bitblt (nrows ncols from-array from-row from-col to-array to-row to-col)
   (multiple-value-bind (nrows ncols from from-offset from-stride to to-offset to-stride)
@@ -150,6 +148,43 @@
                       from from-offset)
         (incf from-offset from-stride)
         (incf to-offset to-stride)))))
+
+(defun 2d-array-bitblt-matrix (colour-matrix nrows ncols from-array from-row from-col to-array to-row to-col)
+  (multiple-value-bind (nrows ncols from from-offset from-stride to to-offset to-stride)
+      (compute-blit-info-dest-src nrows ncols from-array from-row from-col to-array to-row to-col)
+    (assert (typep colour-matrix 'colour-matrix))
+    (assert (simple-ub32-vector-p from))
+    (assert (simple-ub32-vector-p to))
+    (%2d-array-bitblt-matrix
+     (colour-matrix-elements colour-matrix)
+     nrows ncols
+     from from-offset from-stride
+     to to-offset to-stride)))
+
+(defun %2d-array-bitblt-matrix-inner (matrix ncols from from-offset to to-offset)
+  (declare (optimize (speed 3) (safety 0) (debug 0))
+           (type matrix4 matrix)
+           (type fixnum ncols from-offset to-offset)
+           (type (simple-array colour (*)) from to))
+  (loop
+     for x fixnum below ncols
+     do
+       (setf (aref to to-offset)
+             (%colour-matrix-multiply matrix (aref from from-offset)))
+       (incf from-offset)
+       (incf to-offset)))
+
+(defun %2d-array-bitblt-matrix (matrix nrows ncols from from-offset from-stride to to-offset to-stride)
+  (declare (optimize (speed 3) (safety 0) (debug 0))
+           (type matrix4 matrix)
+           (type fixnum nrows ncols from-offset from-stride to-offset to-stride)
+           (type (simple-array colour (*)) from to))
+  (loop
+     for y fixnum below nrows
+     do
+       (%2d-array-bitblt-matrix-inner matrix ncols from from-offset to to-offset)
+       (incf from-offset from-stride)
+       (incf to-offset to-stride)))
 
 (defun 2d-array-bitset (nrows ncols colour to-array to-row to-col)
   (multiple-value-bind (nrows ncols to to-offset to-stride)

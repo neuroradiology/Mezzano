@@ -1,18 +1,20 @@
-;;;; Copyright (c) 2015-2016 Henry Harrington <henry.harrington@gmail.com>
-;;;; This code is licensed under the MIT license.
+;;;; HTTP-based file-system host.
+;;;;
+;;;; This implements a simple host that allows simple HTTP requests to
+;;;; be performed via the standard file functions.
 
 (require :babel)
 
 (defpackage :mezzano.file-system.http
-  (:export #:http-host)
-  (:use #:cl #:mezzano.file-system))
+  (:use #:cl #:mezzano.file-system)
+  (:export #:http-host))
 
 (in-package :mezzano.file-system.http)
 
 (defvar *permit-redirects* t
   "If true, then redirects are followed. Otherwise 3xx status codes are treated as not-found.")
 
-(defclass http-host () ())
+(defclass http-host (file-system-host) ())
 
 (defmethod host-name ((host http-host))
   (declare (ignore host))
@@ -22,15 +24,13 @@
   (declare (ignore host))
   ())
 
-(defclass http-binary-stream (sys.gray:fundamental-binary-input-stream
-                              sys.gray:fundamental-binary-output-stream
+(defclass http-binary-stream (mezzano.gray:fundamental-binary-input-stream
                               file-stream)
   ((path :initarg :path :reader path)
    (position :initarg :position :accessor stream-position)
    (buffer :initarg :buffer :reader stream-buffer)))
 
-(defclass http-character-stream (sys.gray:fundamental-character-input-stream
-                                 sys.gray:fundamental-character-output-stream
+(defclass http-character-stream (mezzano.gray:fundamental-character-input-stream
                                  file-stream)
   ((path :initarg :path :reader path)
    (position :initarg :position :accessor stream-position)
@@ -96,17 +96,9 @@
           (cdr (pathname-device path))
           (pathname-name path)))
 
-(defmethod unparse-pathname (path (host http-host))
+(defmethod namestring-using-host ((host http-host) path)
   (declare (ignore host))
   (unparse-http-path path))
-
-(defmethod unparse-pathname-file (pathname (host http-host))
-  (declare (ignore host))
-  (unparse-http-path pathname))
-
-(defmethod unparse-pathname-directory (pathname (host http-host))
-  (declare (ignore host))
-  (unparse-http-path pathname))
 
 (defun match-header (header line)
   (and (< (length header) (length line))
@@ -132,10 +124,6 @@
                  (vector-push-extend (char hex-digit (ldb (byte 4 4) byte)) result)
                  (vector-push-extend (char hex-digit (ldb (byte 4 0) byte)) result))))
     result))
-
-(defun type-equal (x y)
-  (and (subtypep x y)
-       (subtypep y x)))
 
 (defun decode-buffer (buffer external-format)
   ;; Babel doesn't seem to understand external-formats properly, and ignores the EOL style.
@@ -221,16 +209,18 @@
 
 (defun http-request (host port path)
   ;; FIXME: Should catch unknown host & do something with that.
-  (sys.net::with-open-network-stream (con host port)
-    (sys.net::buffered-format con "GET ~A HTTP/1.1~%Host: ~A~%~%" path host)
+  (mezzano.network::with-open-network-stream (con host port)
+    (mezzano.network:buffered-format con "GET ~A HTTP/1.1~%Host: ~A~%~%" path host)
     (read-http-response con)))
 
 (defun make-http-stream (pathname body element-type external-format)
-  (if (type-equal element-type 'character)
+  (if (mezzano.internals::type-equal element-type 'character)
       (make-instance 'http-character-stream
                      :path pathname
                      :position 0
-                     :buffer (decode-buffer body external-format))
+                     :buffer (decode-buffer body external-format)
+                     :external-format (mezzano.internals::make-external-format
+                                       'character external-format))
       (make-instance 'http-binary-stream
                      :path pathname
                      :position 0
@@ -254,8 +244,8 @@
   (check-type direction (member :input :probe))
   (assert (not (eql if-does-not-exist :create)) (if-does-not-exist)
           ":IF-DOES-NOT-EXIST :CREATE not supported.")
-  (when (and (not (type-equal element-type '(unsigned-byte 8)))
-             (not (type-equal element-type 'character)))
+  (when (and (not (mezzano.internals::type-equal element-type '(unsigned-byte 8)))
+             (not (mezzano.internals::type-equal element-type 'character)))
     (error "Only (UNSIGNED-BYTE 8) and CHARACTER element types supported."))
   (let (version status-code reason-phrase headers body
         (redirect-count 0))
@@ -287,11 +277,11 @@
                 :format-control "HTTP ~D ~A"
                 :format-arguments (list status-code reason-phrase)))))))
 
-(defmethod sys.gray:stream-element-type ((stream http-binary-stream))
+(defmethod mezzano.gray:stream-element-type ((stream http-binary-stream))
   (declare (ignore stream))
   '(unsigned-byte 8))
 
-(defmethod sys.gray:stream-read-byte ((stream http-binary-stream))
+(defmethod mezzano.gray:stream-read-byte ((stream http-binary-stream))
   (cond ((>= (stream-position stream)
              (length (stream-buffer stream)))
          :eof)
@@ -299,22 +289,22 @@
                (aref (stream-buffer stream) (stream-position stream))
              (incf (stream-position stream))))))
 
-(defmethod sys.gray:stream-file-position ((stream http-binary-stream) &optional (position-spec nil position-specp))
+(defmethod mezzano.gray:stream-file-position ((stream http-binary-stream) &optional (position-spec nil position-specp))
   (cond (position-specp
          (setf (stream-position stream)
-               (if (eql position-spec :end)
-                   (length (stream-buffer stream))
-                   position-spec)))
+               (case position-spec
+                 (:start 0)
+                 (:end (length (stream-buffer stream)))
+                 (t position-spec))))
         (t (stream-position stream))))
 
-(defmethod sys.gray:stream-file-length ((stream http-binary-stream))
+(defmethod mezzano.gray:stream-file-length ((stream http-binary-stream))
   (length (stream-buffer stream)))
 
-(defmethod sys.gray:stream-element-type ((stream http-character-stream))
-  (declare (ignore stream))
+(defmethod mezzano.gray:stream-element-type ((stream http-character-stream))
   'character)
 
-(defmethod sys.gray:stream-read-char ((stream http-character-stream))
+(defmethod mezzano.gray:stream-read-char ((stream http-character-stream))
   (cond ((>= (stream-position stream)
              (length (stream-buffer stream)))
          :eof)
@@ -322,15 +312,16 @@
                (aref (stream-buffer stream) (stream-position stream))
              (incf (stream-position stream))))))
 
-(defmethod sys.gray:stream-file-position ((stream http-character-stream) &optional (position-spec nil position-specp))
+(defmethod mezzano.gray:stream-file-position ((stream http-character-stream) &optional (position-spec nil position-specp))
   (cond (position-specp
          (setf (stream-position stream)
-               (if (eql position-spec :end)
-                   (length (stream-buffer stream))
-                   position-spec)))
+               (case position-spec
+                 (:start 0)
+                 (:end (length (stream-buffer stream)))
+                 (t position-spec))))
         (t (stream-position stream))))
 
-(defmethod sys.gray:stream-file-length ((stream http-character-stream))
+(defmethod mezzano.gray:stream-file-length ((stream http-character-stream))
   (length (stream-buffer stream)))
 
 (defmethod directory-using-host ((host http-host) pathname &key)

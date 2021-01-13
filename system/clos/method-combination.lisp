@@ -1,13 +1,14 @@
-;;;; Copyright (c) 2016 Henry Harrington <henry.harrington@gmail.com>
-;;;; This code is licensed under the MIT license.
-
 (in-package :mezzano.clos)
 
-(defvar *method-combinations* (make-hash-table))
+(defvar *method-combinations* (make-hash-table :synchronized t :weakness :key))
 
 (defclass method-combination ()
   ((%name :initarg :name :reader method-combination-name)
-   (%combiner :initarg :combiner :reader method-combination-combiner)))
+   (%combiner :initarg :combiner :reader method-combination-combiner)
+   (documentation :initform nil :initarg :documentation)))
+
+(defmethod method-combination-name ((method-combination null))
+  'standard)
 
 (defun register-method-combination (name combiner)
   (check-type name symbol)
@@ -23,16 +24,29 @@
 (defun method-combination-object-arguments (method-combination-object)
   (rest method-combination-object))
 
+(defgeneric find-method-combination (generic-function
+                                     method-combination-type-name
+                                     method-combination-options))
+
+(defmethod find-method-combination ((generic-function standard-generic-function)
+                                    (method-combination-type-name (eql 'standard))
+                                    method-combination-options)
+  (assert (endp method-combination-options) (method-combination-options)
+          "The STANDARD method combination accepts no arguments.")
+  nil)
+
+(defmethod find-method-combination ((generic-function standard-generic-function)
+                                    method-combination-type-name
+                                    method-combination-options)
+  (let ((mc (gethash method-combination-type-name *method-combinations*)))
+    (when (not mc)
+      (error "Unknown method combination ~S"
+             method-combination-type-name))
+    (list* mc method-combination-options)))
+
 (defun resolve-method-combination (name &rest args)
-  (cond ((eql name 'standard)
-         (assert (endp args) (args)
-                 "The STANDARD method combination accepts no arguments.")
-         nil)
-        (t
-         (let ((mc (gethash name *method-combinations*)))
-           (when (not mc)
-             (error "Unknown method combination ~S." name))
-           (list* mc args)))))
+  ;; FIXME: Needs to use an appropriate instance of the generic function
+  (find-method-combination #'class-name name args))
 
 (defmacro define-method-combination (name &rest args)
   (cond ((and args
@@ -64,8 +78,6 @@
                             (make-method ,form)))
            form))))
 
-;; To be reinstated when CLOS is usable in the cross-compilation environment.
-#+(or)
 (defclass method-group-specifier ()
   ((%name :initarg :name :reader method-group-specifier-name)
    (%qualifier-patterns :initarg :qualifier-patterns :reader method-group-specifier-qualifier-patterns)
@@ -73,14 +85,6 @@
    (%description :initarg :description :reader method-group-specifier-description)
    (%order-form :initarg :order-form :reader method-group-specifier-order-form)
    (%required :initarg :required :reader method-group-specifier-required)))
-
-(defstruct method-group-specifier
-  name
-  qualifier-patterns
-  predicate
-  description
-  order-form
-  required)
 
 (defun parse-method-group-specifier (specifier)
   (let ((name (first specifier))
@@ -107,7 +111,7 @@
              (assert (or (eql pattern '*) (listp pattern))))))
     (destructuring-bind (&key description order required)
         remaining-specifier
-      (make-method-group-specifier
+      (make-instance 'method-group-specifier
        :name name
        :qualifier-patterns qualifier-patterns
        :predicate predicate
@@ -200,6 +204,7 @@
 )
 
 (defun invalid-method-error (method format-control &rest format-arguments)
+  (declare (ignore method))
   (apply #'error format-control format-arguments))
 
 ;; Built-in method combinations.

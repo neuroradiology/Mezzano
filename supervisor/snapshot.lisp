@@ -1,15 +1,20 @@
-;;;; Copyright (c) 2011-2016 Henry Harrington <henry.harrington@gmail.com>
-;;;; This code is licensed under the MIT license.
+;;;; Whole-system transparent persistence support.
 
 (in-package :mezzano.supervisor)
 
 (sys.int::defglobal *snapshot-in-progress* nil)
+(sys.int::defglobal *snapshot-state*)
 (sys.int::defglobal *snapshot-inhibit*)
 
 (sys.int::defglobal *snapshot-disk-request*)
 (sys.int::defglobal *snapshot-bounce-buffer-page*)
 (sys.int::defglobal *snapshot-pending-writeback-pages-count*)
 (sys.int::defglobal *snapshot-pending-writeback-pages*)
+
+(sys.int::defglobal *enable-snapshot-cow-fast-path* nil)
+
+(sys.int::defglobal *snapshot-epoch*)
+(sys.int::defglobal *snapshot-next-epoch*)
 
 (declaim (inline %fast-page-copy))
 (defun %fast-page-copy (destination source)
@@ -58,44 +63,69 @@
 
 (defun snapshot-copy-wired-area ()
   ;; FIXME: Only copy dirty pages.
+  ;; FIXME: See comment in INITIALIZE-SNAPSHOT about card-table sparseness
   ;; Walk through each wired page and allocate a new block for it.
-  (loop
-     for wired-page from #x200000 below sys.int::*wired-area-bump* by #x1000
-     for pte = (or (get-pte-for-address wired-page nil)
-                   (panic "No page table entry for wired-page " wired-page))
-     for page-frame = (ash (pte-physical-address (sys.int::memref-unsigned-byte-64 pte 0)) -12)
-     for backing-frame = (physical-page-frame-next page-frame)
-     for bme-addr = (or (block-info-for-virtual-address-1 wired-page nil)
-                        (panic "No block map entry for wired-page " wired-page))
-     for bme = (sys.int::memref-unsigned-byte-64 bme-addr 0)
-     for new-block = (or (store-alloc 1)
-                         (panic "Aiiee, out of store when copying wired area!"))
-     for old-block = (ash bme (- sys.int::+block-map-id-shift+))
-     do
-       (setf (physical-page-frame-block-id backing-frame) new-block)
-       (setf bme (logior (ash new-block sys.int::+block-map-id-shift+)
-                         sys.int::+block-map-committed+
-                         (logand bme #xFF))
-             (sys.int::memref-unsigned-byte-64 bme-addr 0) bme)
-       (decf *store-fudge-factor*)
-       (store-deferred-free old-block 1))
+  (flet ((alloc-blocks (start end &key sparse)
+           (map-ptes
+            start end
+            (dx-lambda (wired-page pte)
+              (when (not pte)
+                (panic "No page table entry for wired-page " wired-page))
+              (let ((page-frame (and (page-present-p pte 0)
+                                     (ash (pte-physical-address (sys.int::memref-unsigned-byte-64 pte 0)) -12))))
+                (when page-frame
+                  (let* ((backing-frame (physical-page-frame-next page-frame))
+                         (bme-addr (or (block-info-for-virtual-address-1 wired-page nil)
+                                       (panic "No block map entry for wired-page " wired-page)))
+                         (bme (sys.int::memref-unsigned-byte-64 bme-addr 0))
+                         (new-block (or (store-alloc 1)
+                                        (panic "Aiiee, out of store when copying wired area!")))
+                         (old-block (ash bme (- sys.int::+block-map-id-shift+))))
+                    (setf (physical-page-frame-block-id backing-frame) new-block)
+                    (setf (physical-page-frame-type backing-frame) :wired-backing-writeback)
+                    (setf bme (logior (ash new-block sys.int::+block-map-id-shift+)
+                                      sys.int::+block-map-committed+
+                                      (logand bme #xFF))
+                          (sys.int::memref-unsigned-byte-64 bme-addr 0) bme)
+                    (decf *store-fudge-factor*)
+                    (store-deferred-free old-block 1)))))
+            :sparse sparse)))
+    (alloc-blocks sys.int::*wired-area-base* sys.int::*wired-area-bump*)
+    (alloc-blocks sys.int::+card-table-base+
+                  (+ sys.int::+card-table-base+ sys.int::+card-table-size+)
+                  :sparse t)
+    (alloc-blocks sys.int::*wired-function-area-limit* sys.int::*function-area-base*))
+  ;; FIXME: This should completely suspend other CPUs for the duration. Stopping
+  ;; the world is not enough.
   ;; I bet this could be partially done with CoW. Evil.
   ;; Copy without interrupts to avoid smearing.
   (without-interrupts
-    (loop
-       for wired-page from #x200000 below sys.int::*wired-area-bump* by #x1000
-       for pte = (or (get-pte-for-address wired-page nil)
-                     (panic "No page table entry for " wired-page))
-       for page-frame = (ash (pte-physical-address (sys.int::memref-unsigned-byte-64 pte 0)) -12)
-       for other-frame = (physical-page-frame-next page-frame)
-       do
-         (%fast-page-copy (convert-to-pmap-address (ash other-frame 12))
-                          wired-page)
-         (snapshot-add-to-writeback-list other-frame))))
+    (flet ((copy-pages (start end &key sparse)
+             (map-ptes
+              start end
+              (dx-lambda (wired-page pte)
+                (when (not pte)
+                  (panic "No page table entry for " wired-page))
+                (let* ((page-frame (and (page-present-p pte)
+                                        (ash (pte-physical-address (sys.int::memref-unsigned-byte-64 pte 0)) -12)))
+                       (other-frame (and page-frame
+                                         (physical-page-frame-next page-frame))))
+                  (when page-frame
+                    (%fast-page-copy (convert-to-pmap-address (ash other-frame 12))
+                                     wired-page)
+                    (snapshot-add-to-writeback-list other-frame))))
+              :sparse sparse)))
+      (copy-pages sys.int::*wired-area-base* sys.int::*wired-area-bump*)
+      (copy-pages sys.int::+card-table-base+
+                  (+ sys.int::+card-table-base+ sys.int::+card-table-size+)
+                  :sparse t)
+      (copy-pages sys.int::*wired-function-area-limit* sys.int::*function-area-base*))))
 
 (defun snapshot-clone-cow-page (new-frame fault-addr)
   (let* ((pte (or (get-pte-for-address fault-addr nil)
-                  (panic "No PTE for CoW address?")))
+                  (panic "No PTE for CoW address?" fault-addr)))
+         (block-info (or (block-info-for-virtual-address fault-addr)
+                         (panic "No block info for CoW address?" fault-addr)))
          (old-frame (ash (pte-physical-address (sys.int::memref-unsigned-byte-64 pte 0)) -12)))
     (ensure (page-copy-on-write-p pte)
             "Copying non-CoW page?")
@@ -107,18 +137,26 @@
           (physical-page-frame-type old-frame) :inactive-writeback)
     (append-to-page-replacement-list new-frame)
     ;; Point the PTE at the new page, disable copy on write and reenable write access.
+    (begin-tlb-shootdown)
     (setf (sys.int::memref-unsigned-byte-64 pte 0)
           (make-pte new-frame
-                    :writable t))
+                    :writable (and (block-info-writable-p block-info)
+                                   (not (block-info-track-dirty-p block-info)))))
     (flush-tlb-single fault-addr)
+    (tlb-shootdown-single fault-addr)
+    (finish-tlb-shootdown)
     #+(or)(debug-print-line "Copied page " fault-addr)))
 
 (defun snapshot-clone-cow-page-via-page-fault (interrupt-frame fault-addr)
-  (let ((new-frame (allocate-physical-pages 1)))
-    (when (not new-frame)
-      ;; No memory. Punt to the pager, does not return.
-      (wait-for-page-via-interrupt interrupt-frame fault-addr))
-    (snapshot-clone-cow-page new-frame fault-addr)))
+  (cond (*enable-snapshot-cow-fast-path*
+         ;; Doesn't work on SMP, due to issues with TLB shootdown.
+         (let ((new-frame (allocate-physical-pages 1)))
+           (when (not new-frame)
+             ;; No memory. Punt to the pager, does not return.
+             (wait-for-page-via-interrupt interrupt-frame fault-addr))
+           (snapshot-clone-cow-page new-frame fault-addr)))
+        (t
+         (wait-for-page-via-interrupt interrupt-frame fault-addr))))
 
 (defun pop-pending-snapshot-page ()
   "Pop the next pending snapshot page.
@@ -128,54 +166,74 @@ Returns 4 values:
   FREEP - True if FRAME should be freed after it has been written back.
   BLOCK-ID - ID of the block to write to. This will always be a valid block, not a deferred block.
   ADDRESS - Virtual address of the page to write back."
-  (with-mutex (*vm-lock*)
-    (without-interrupts
-      (let* ((frame *snapshot-pending-writeback-pages*)
-             (address (physical-page-virtual-address frame))
-             (block-id (physical-page-frame-block-id frame)))
-        ;; Remove frame from list.
-        (setf *snapshot-pending-writeback-pages* (physical-page-frame-next frame))
-        (when *snapshot-pending-writeback-pages*
-          (setf (physical-page-frame-prev *snapshot-pending-writeback-pages*) nil))
-        (decf *snapshot-pending-writeback-pages-count*)
-        (case (physical-page-frame-type frame)
-          (:active-writeback
-           ;; Page is mapped in memory.
-           ;; Copy to the bounce buffer.
-           (%fast-page-copy (convert-to-pmap-address (ash *snapshot-bounce-buffer-page* 12))
-                            (convert-to-pmap-address (ash frame 12)))
-           ;; Allow access to the page again.
-           (let* ((pte (or (get-pte-for-address address nil)
-                           (panic "No PTE for CoW address?")))
-                  (frame (ash (pte-physical-address (sys.int::memref-unsigned-byte-64 pte 0)) -12)))
-             ;; Update PTE bits. Clear CoW bit, make writable.
-             (setf (sys.int::memref-unsigned-byte-64 pte 0)
-                   (make-pte frame
-                             :writable t
-                             :dirty (page-dirty-p pte)))
-             (flush-tlb-single address))
-           ;; Return page to normal use.
-           (setf (physical-page-frame-type frame) :active)
-           (append-to-page-replacement-list frame)
-           (values *snapshot-bounce-buffer-page*
-                   ;; Don't free the bounce page.
-                   nil
-                   block-id
-                   address))
-          (:inactive-writeback
-           ;; Page was copied.
-           (values frame
-                   t
-                   block-id
-                   address))
-          (:wired-backing
-           ;; Page is a wired backing page.
-           (values frame
-                   nil
-                   block-id
-                   address))
-          (t (panic "Page " frame " for address " address " has non-writeback type "
-                    (physical-page-frame-type frame))))))))
+  (with-rw-lock-write (*vm-lock*)
+    (begin-tlb-shootdown)
+    (multiple-value-bind (frame freep block-id address)
+        (pop-pending-snapshot-page-1)
+      (tlb-shootdown-single address)
+      (finish-tlb-shootdown)
+      (values frame freep block-id address))))
+
+(defun pop-pending-snapshot-page-1 ()
+  (without-interrupts
+    (let* ((frame *snapshot-pending-writeback-pages*)
+           (address (physical-page-virtual-address frame))
+           (block-id (physical-page-frame-block-id frame)))
+      ;; Remove frame from list.
+      (setf *snapshot-pending-writeback-pages* (physical-page-frame-next frame))
+      (when *snapshot-pending-writeback-pages*
+        (setf (physical-page-frame-prev *snapshot-pending-writeback-pages*) nil))
+      (decf *snapshot-pending-writeback-pages-count*)
+      (case (physical-page-frame-type frame)
+        (:active-writeback
+         ;; Page is mapped in memory.
+         ;; Copy to the bounce buffer.
+         (%fast-page-copy (convert-to-pmap-address (ash *snapshot-bounce-buffer-page* 12))
+                          (convert-to-pmap-address (ash frame 12)))
+         ;; Allow access to the page again.
+         (let* ((pte (or (get-pte-for-address address nil)
+                         (panic "No PTE for CoW address?")))
+                (frame (ash (pte-physical-address (sys.int::memref-unsigned-byte-64 pte 0)) -12))
+                ;; The block map should only be consulted for active pages.
+                ;; Other kinds of pages indicate that the virtual memory was modified
+                ;; and the page may no longer exist in the most recent block map.
+                (block-info (or (block-info-for-virtual-address address)
+                                (panic "No block info for CoW address?" address))))
+           ;; Update PTE bits. Clear CoW bit, make writable.
+           (setf (sys.int::memref-unsigned-byte-64 pte 0)
+                 (make-pte frame
+                           :writable (and (block-info-writable-p block-info)
+                                          (not (block-info-track-dirty-p block-info)))
+                           :dirty (page-dirty-p pte)))
+           (flush-tlb-single address))
+         ;; Return page to normal use.
+         (setf (physical-page-frame-type frame) :active)
+         (append-to-page-replacement-list frame)
+         (values *snapshot-bounce-buffer-page*
+                 ;; Don't free the bounce page.
+                 nil
+                 block-id
+                 address))
+        (:inactive-writeback
+         ;; Page was copied.
+         (values frame
+                 t
+                 block-id
+                 address))
+        (:wired-backing-writeback
+         ;; Page is a wired backing page.
+         ;; Copy to the bounce buffer.
+         ;; Page may be freed during writeback if VM is modified.
+         (%fast-page-copy (convert-to-pmap-address (ash *snapshot-bounce-buffer-page* 12))
+                          (convert-to-pmap-address (ash frame 12)))
+         ;; Return page to normal use.
+         (setf (physical-page-frame-type frame) :wired-backing)
+         (values *snapshot-bounce-buffer-page*
+                 nil
+                 block-id
+                 address))
+        (t (panic "Frame " frame " for address " address " has non-writeback type "
+                  (physical-page-frame-type frame)))))))
 
 (defun snapshot-write-back-pages ()
   ;; Write dirty/copied pages back.
@@ -249,7 +307,7 @@ Returns 4 values:
 (defun snapshot-block-map-outer-level (bml next-fn address-part)
   (let ((bml-disk (or (store-alloc 1)
                       (panic "Unable to allocate disk space for new block map.")))
-        (bml-memory (convert-to-pmap-address (* (pager-allocate-page :other) +4k-page-size+)))
+        (bml-memory (convert-to-pmap-address (* (pager-allocate-page :new-type :other) +4k-page-size+)))
         (bml-count 0)
         (next-address-part (ash address-part 9)))
     (dotimes (i 512)
@@ -287,7 +345,6 @@ Returns 4 values:
   (when *paging-read-only*
     (debug-print-line "Not taking snapshot, running read-only.")
     (return-from take-snapshot))
-  (debug-print-line "Begin snapshot.")
   ;; TODO: Ensure there is a free area of at least 64kb in the wired area.
   ;; That should be enough to boot the system.
   (set-snapshot-light t)
@@ -297,8 +354,12 @@ Returns 4 values:
         (bml4-block nil)
         (previously-deferred-free-blocks nil))
     ;; Stop the world before taking the *VM-LOCK*. There may be PA threads waiting for pages.
-    (with-world-stopped
-      (with-mutex (*vm-lock*)
+    (with-world-stopped ()
+      (when (not (zerop *snapshot-inhibit*))
+        (set-snapshot-light nil)
+        (return-from take-snapshot :retry))
+      (debug-print-line "Begin snapshot.")
+      (with-rw-lock-write (*vm-lock*)
         (debug-print-line "deferred blocks: " *store-freelist-n-deferred-free-blocks*)
         (debug-print-line "Copying wired area.")
         (snapshot-copy-wired-area)
@@ -314,8 +375,8 @@ Returns 4 values:
     (snapshot-write-back-pages)
     ;; Update the block map & freelist entries in the header.
     (debug-print-line "Updating disk header.")
-    (let ((header (convert-to-pmap-address (* (with-mutex (*vm-lock*)
-                                              (pager-allocate-page :other))
+    (let ((header (convert-to-pmap-address (* (with-rw-lock-write (*vm-lock*)
+                                                (pager-allocate-page :new-type :other))
                                             +4k-page-size+))))
       (disk-submit-request *snapshot-disk-request*
                            *paging-disk*
@@ -329,68 +390,115 @@ Returns 4 values:
       (setf (sys.int::memref-unsigned-byte-64 (+ header +image-header-freelist+) 0) freelist-block)
       (snapshot-write-disk 0 header)
       (free-page header))
-    (with-mutex (*vm-lock*)
+    (with-rw-lock-write (*vm-lock*)
       (store-release-deferred-blocks previously-deferred-free-blocks)))
   (set-snapshot-light nil)
-  (debug-write-line "End snapshot."))
+  (debug-print-line "End snapshot."))
+
+(defun current-snapshot-epoch ()
+  "Return an event that identifies the current snapshot epoch.
+This event will be signalled when the epoch changes."
+  *snapshot-epoch*)
 
 (defun snapshot-thread ()
-  (loop
-     (when (zerop *snapshot-inhibit*)
-       (take-snapshot))
-     ;; After taking a snapshot, clear *snapshot-in-progress*
-     ;; and go back to sleep.
-     (%disable-interrupts)
-     (%lock-thread sys.int::*snapshot-thread*)
-     (setf *snapshot-in-progress* nil)
-     (setf (thread-state sys.int::*snapshot-thread*) :sleeping
-           (thread-wait-item sys.int::*snapshot-thread*) "Snapshot")
-     (%run-on-wired-stack-without-interrupts (sp fp)
-      (%reschedule-via-wired-stack sp fp))))
+  ;; A preallocated timer is required here because the snapshot thread
+  ;; runs at :supervisor priority and must not cons outside of boot.
+  (with-timer (snapshot-retry-timer)
+    (loop
+       ;; Retry occurs when *SNAPSHOT-INHIBIT* is non-zero.
+       (loop
+          while (or (not (eql *snapshot-inhibit* 0))
+                    (eql (take-snapshot) :retry))
+          do (timer-sleep snapshot-retry-timer 0.1))
+       ;; After taking a snapshot, clear *snapshot-in-progress*
+       ;; and go back to sleep.
+       ;; FIXME: There's a race between setting this event and the thread
+       ;; going to sleep. (SETF EVENT-STATE) can't be called with the
+       ;; global thread-lock held.
+       (setf (event-state *snapshot-state*) t)
+       ;; Move to the next epoch.
+       (setf (event-state *snapshot-epoch*) t)
+       (setf *snapshot-epoch* *snapshot-next-epoch*)
+       (%disable-interrupts)
+       (acquire-global-thread-lock)
+       (setf *snapshot-in-progress* nil)
+       (setf (thread-state sys.int::*snapshot-thread*) :sleeping
+             (thread-wait-item sys.int::*snapshot-thread*) "Snapshot")
+       (%run-on-wired-stack-without-interrupts (sp fp)
+         (%reschedule-via-wired-stack sp fp)))))
+
+(defun allocate-snapshot-wired-backing-pages (start end &key sparse)
+  (map-ptes
+   start end
+   (dx-lambda (wired-page pte)
+     (when (not pte)
+       (panic "No page table entry for wired page " wired-page))
+     (let* ((page-frame (and (page-present-p pte)
+                             (ash (pte-physical-address (sys.int::memref-unsigned-byte-64 pte 0)) -12))))
+       (when page-frame
+         ;; ### Could disable snapshotting if this can't be allocated.
+         (let ((frame (allocate-physical-pages 1
+                                               :mandatory-p "wired backing pages"
+                                               :type :wired-backing)))
+           (setf (physical-page-frame-next page-frame) frame)
+           (setf (physical-page-virtual-address frame) wired-page)))))
+   :sparse sparse))
 
 (defun initialize-snapshot ()
+  (when (not (boundp '*snapshot-state*))
+    (setf *snapshot-state* (make-event :name 'snapshot-not-in-progress)))
+  (setf (event-state *snapshot-state*) nil)
+  (cond ((boundp '*snapshot-epoch*)
+         (setf (event-state *snapshot-epoch*) t)
+         (setf *snapshot-epoch* *snapshot-next-epoch*))
+        (t
+         (setf *snapshot-epoch* (make-event :name 'snapshot-epoch))))
   (setf *snapshot-disk-request* (make-disk-request))
   (setf *snapshot-in-progress* nil)
   (setf *snapshot-inhibit* 1)
+  (setf *enable-snapshot-cow-fast-path* nil)
   ;; Allocate pages to copy the wired area into.
   ;; TODO: Use 2MB pages when possible.
   ;; ### when the wired area expands this will need to be something...
-  (loop
-     for wired-page from #x200000 below sys.int::*wired-area-bump* by #x1000
-     ;; ### Could disable snapshotting if this can't be allocated.
-     do (let* ((frame (allocate-physical-pages 1
-                                               :mandatory-p "wired backing pages"
-                                               :type :wired-backing))
-               (pte (or (get-pte-for-address wired-page nil)
-                        (panic "No page table entry for wired page " wired-page)))
-               (page-frame (ash (pte-physical-address (sys.int::memref-unsigned-byte-64 pte 0)) -12)))
-          (setf (physical-page-frame-next page-frame) frame)
-          (setf (physical-page-virtual-address frame) wired-page)))
+  (allocate-snapshot-wired-backing-pages sys.int::*wired-area-base* sys.int::*wired-area-bump*)
+  (allocate-snapshot-wired-backing-pages sys.int::*wired-function-area-limit* sys.int::*function-area-base*)
+  ;; FIXME: The card table is mostly sparse. The system spends ages scanning
+  ;; it during boot looking for allocated regions but mostly doing nothing.
+  ;; Could modify the bootloader to allocate backing pages.
+  (allocate-snapshot-wired-backing-pages sys.int::+card-table-base+
+                                         (+ sys.int::+card-table-base+ sys.int::+card-table-size+)
+                                         :sparse t)
   ;; ### same here.
   (setf *snapshot-bounce-buffer-page* (allocate-physical-pages 1
                                                                :mandatory-p "snapshot bounce page")))
 
 (defun snapshot ()
   ;; Run a GC before snapshotting to reduce the amount of space required.
-  (sys.int::gc)
+  (sys.int::gc :full t)
   ;; Attempt to wake the snapshot thread, only waking it if
   ;; there is not snapshot currently in progress.
-  (let ((did-wake (safe-without-interrupts ()
-                    (with-thread-lock (sys.int::*snapshot-thread*)
-                      (when (not *snapshot-in-progress*)
-                        (setf *snapshot-in-progress* t)
-                        (setf (thread-state sys.int::*snapshot-thread*) :runnable)
-                        (with-symbol-spinlock (*global-thread-lock*)
-                          (push-run-queue sys.int::*snapshot-thread*))
-                        t)))))
+  ;; FIXME: locking for SMP.
+  (let* ((next-epoch (make-event :name 'snapshot-epoch))
+         (did-wake (safe-without-interrupts ()
+                     (let ((was-in-progress (sys.int::cas (sys.int::symbol-global-value '*snapshot-in-progress*) nil t)))
+                       (when (eql was-in-progress nil)
+                         (setf (event-state *snapshot-state*) nil)
+                         (setf *snapshot-next-epoch* next-epoch)
+                         (wake-thread sys.int::*snapshot-thread*)
+                         t)))))
     (when did-wake
       (thread-yield))))
+
+(defun wait-for-snapshot-completion ()
+  "If a snapshot is currently being take, then wait for it to complete."
+  (event-wait *snapshot-state*))
 
 (defmacro with-snapshot-inhibited (options &body body)
   `(call-with-snapshot-inhibited (dx-lambda () ,@body) ,@options))
 
 (defun call-with-snapshot-inhibited (fn)
-  (incf *snapshot-inhibit*)
+  ;; FIXME: Switch to ATOMIC-INCF/-DECF. Needs xcompiler fixes for declaim.
+  (sys.int::%atomic-fixnum-add-symbol '*snapshot-inhibit* 1)
   (unwind-protect
        (funcall fn)
-    (decf *snapshot-inhibit*)))
+    (sys.int::%atomic-fixnum-add-symbol '*snapshot-inhibit* -1)))

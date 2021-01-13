@@ -1,6 +1,3 @@
-;;;; Copyright (c) 2011-2016 Henry Harrington <henry.harrington@gmail.com>
-;;;; This code is licensed under the MIT license.
-
 (in-package :mezzano.supervisor)
 
 (defun initialize-boot-cpu ()
@@ -9,7 +6,7 @@
                             8
                             (* 1 8))
                          1024))
-         (sp-el1 (+ sys.int::*bsp-wired-stack-base* sys.int::*bsp-wired-stack-size*)))
+         (sp-el1 (+ (car sys.int::*bsp-wired-stack*) (cdr sys.int::*bsp-wired-stack*))))
     (flet ((gen-vector (offset common entry)
              (let ((base (+ addr offset))
                    (common-entry (sys.int::%object-ref-signed-byte-64
@@ -115,7 +112,10 @@
   (mezzano.lap.arm64:add :x0 :sp #.sys.int::+tag-object+)
   (:gc :frame :interrupt t)
   ;; Call handler.
-  (mezzano.lap.arm64:ldr :x9 (:object :x7 #.sys.int::+fref-entry-point+))
+  ;; Read the function out of the fref.
+  (mezzano.lap.arm64:ldr :x6 (:object :x7 #.sys.int::+fref-function+))
+  ;; Read the function entry point and call it.
+  (mezzano.lap.arm64:ldr :x9 (:object :x6 #.sys.int::+function-entry-point+))
   (mezzano.lap.arm64:blr :x9)
   ;; Drop the frame.
   (mezzano.lap.arm64:add :sp :sp 16)
@@ -186,6 +186,67 @@
   (mezzano.lap.arm64:add :x0 :sp #.sys.int::+tag-object+)
   (:gc :frame :interrupt t)
   ;; Call handler.
-  (mezzano.lap.arm64:ldr :x9 (:object :x7 #.sys.int::+fref-entry-point+))
+  ;; Read the function out of the fref.
+  (mezzano.lap.arm64:ldr :x6 (:object :x7 #.sys.int::+fref-function+))
+  ;; Read the function entry point and call it.
+  (mezzano.lap.arm64:ldr :x9 (:object :x6 #.sys.int::+function-entry-point+))
   (mezzano.lap.arm64:blr :x9)
   (mezzano.lap.arm64:hlt 4))
+
+(defun broadcast-panic-ipi ()
+  nil)
+
+(defun broadcast-wakeup-ipi ()
+  nil)
+
+(defun quiesce-cpus-for-world-stop ()
+  nil)
+
+(defun begin-tlb-shootdown ()
+  nil)
+
+(defun tlb-shootdown-single (address)
+  (declare (ignore address))
+  nil)
+
+(defun tlb-shootdown-range (base length)
+  (declare (ignore base length))
+  nil)
+
+(defun tlb-shootdown-all ()
+  nil)
+
+(defun finish-tlb-shootdown ()
+  nil)
+
+(defun local-cpu-idle-thread ()
+  sys.int::*bsp-idle-thread*)
+
+(defun boot-secondary-cpus ()
+  nil)
+
+(sys.int::defglobal *n-up-cpus* 1)
+
+(defstruct (cpu
+             (:area :wired))
+  state
+  info-vector
+  apic-id
+  idle-thread
+  wired-stack
+  exception-stack
+  irq-stack
+  lapic-timer-active)
+
+(defun logical-core-count ()
+  1)
+
+(defun preemption-timer-reset (time-remaining)
+  (declare (ignore time-remaining))
+  nil)
+
+(defun preemption-timer-remaining ()
+  nil)
+
+(defun stop-other-cpus-for-debug-magic-button ()
+  nil)

@@ -1,7 +1,6 @@
-;;;; Copyright (c) 2011-2016 Henry Harrington <henry.harrington@gmail.com>
-;;;; This code is licensed under the MIT license.
+;;;; Basic Common Lisp macros
 
-(in-package :sys.int)
+(in-package :mezzano.internals)
 
 (defmacro lambda (lambda-list &body body)
   `#'(lambda ,lambda-list ,@body))
@@ -49,7 +48,8 @@
 
 (defmacro psetq (&rest pairs)
   ;; Make sure all variables are symbols, then hand off to PSETF.
-  (loop for var in pairs by #'cddr
+  (loop
+     for var in pairs by #'cddr
      do (check-type var symbol))
   `(psetf ,@pairs))
 
@@ -108,7 +108,8 @@
            (tagbody ,head
               (if (null ,itr)
                   (return (let ((,var nil))
-                            (declare ,@declares)
+                            (declare ,@declares
+                                     (ignorable ,var))
                             ,result-form)))
               (let ((,var (car ,itr)))
                 (declare ,@declares)
@@ -136,12 +137,32 @@
   `(multiple-value-call #'list ,value-form))
 
 (defmacro nth-value (n form)
-  `(nth ,n (multiple-value-list ,form)))
+  (cond ((eql n 0)
+         `(values ,form))
+        ((and (integerp n)
+              (<= 0 n 32)) ; Don't generate a zillion temporaries for large N.
+         (let ((temps (loop
+                         repeat n
+                         collect (gensym)))
+               (value (gensym "VALUE")))
+           `(multiple-value-bind (,@temps ,value)
+                ,form
+              (declare (ignore ,@temps))
+              ,value)))
+        (t
+         (let ((n-value (gensym "N"))
+               (values (gensym "VALUES")))
+           `(let ((,n-value ,n))
+              (flet ((nth-value-closure (&rest ,values)
+                       (declare (dynamic-extent ,values))
+                       (nth ,n-value ,values)))
+                (declare (dynamic-extent #'nth-value-closure))
+                (multiple-value-call #'nth-value-closure ,form)))))))
 
 (defmacro case (keyform &body cases)
   (let ((test-key (gensym "CASE-KEY")))
     `(let ((,test-key ,keyform))
-       (declare (ignoreable ,test-key))
+       (declare (ignorable ,test-key))
        (cond
          ,@(mapcar (lambda (clause)
                      (declare (type cons clause))
@@ -179,8 +200,8 @@
                (min-key (apply #'min unique-keys))
                (max-key (apply #'max unique-keys))
                (range (- (1+ max-key) min-key)))
-          (if (and (>= n-keys sys.c::*jump-table-size-min*)
-                   (< range sys.c::*jump-table-size-max*))
+          (if (and (>= n-keys mezzano.compiler::*jump-table-size-min*)
+                   (< range mezzano.compiler::*jump-table-size-max*))
               (let ((default-label (gensym "case-default"))
                     (block-name (gensym "case-block"))
                     (key-sym (gensym "case-key"))
@@ -219,7 +240,7 @@
   (let ((test-key (gensym "CASE-KEY"))
         (all-keys '()))
     `(let ((,test-key ,keyform))
-       (declare (ignoreable ,test-key))
+       (declare (ignorable ,test-key))
        (cond
          ,@(mapcar (lambda (clause)
                      (declare (type cons clause))
@@ -254,8 +275,8 @@
                (min-key (apply #'min unique-keys))
                (max-key (apply #'max unique-keys))
                (range (- (1+ max-key) min-key)))
-          (if (and (>= n-keys sys.c::*jump-table-size-min*)
-                   (< range sys.c::*jump-table-size-max*))
+          (if (and (>= n-keys mezzano.compiler::*jump-table-size-min*)
+                   (< range mezzano.compiler::*jump-table-size-max*))
               (let ((default-label (gensym "ecase-default"))
                     (block-name (gensym "ecase-block"))
                     (key-sym (gensym "ecase-key"))
@@ -340,7 +361,7 @@
 (defmacro typecase (keyform &rest cases)
   (let ((test-key (gensym "CASE-KEY")))
     `(let ((,test-key ,keyform))
-       (declare (ignoreable ,test-key))
+       (declare (ignorable ,test-key))
        (cond
          ,@(mapcar (lambda (clause)
                      (declare (type cons clause))
@@ -356,7 +377,7 @@
 (defmacro etypecase (keyform &rest cases)
   (let ((test-key (gensym "CASE-KEY")))
     `(let ((,test-key ,keyform))
-       (declare (ignoreable ,test-key))
+       (declare (ignorable ,test-key))
        (cond
          ,@(mapcar (lambda (clause)
                      (declare (type cons clause))
@@ -421,70 +442,91 @@
 
 (defmacro prog2 (first-form second-form &rest forms)
   "Evaluate FIRST-FORM, SECOND-FORM, then FORMS in order; returning the value of SECOND-FORM."
-  (let ((sym (gensym)))
-    `(prog1 (progn ,first-form ,second-form) ,@forms)))
+  `(prog1 (progn ,first-form ,second-form) ,@forms))
 
 (defmacro declaim (&rest declaration-specifiers)
   `(eval-when (:compile-toplevel :load-toplevel :execute)
      ,@(mapcar (lambda (x) `(proclaim ',x)) declaration-specifiers)))
 
+(defmacro current-source-location (&optional name)
+  `(lambda () (declare (lambda-name ,(or name 'source-location)))))
+
 ;;; DEFVAR.
-(defmacro defvar (name &optional (initial-value nil initial-valuep) docstring)
-  (if initial-valuep
-      `(progn
-         (declaim (special ,name))
-         (unless (boundp ',name)
-           (setq ,name ,initial-value))
-         ',name)
-      `(progn
-         (declaim (special ,name))
-         ',name)))
+(defmacro defvar (name &optional (initial-value nil initial-valuep) (docstring nil docstringp))
+  (when docstringp
+    (check-type docstring string))
+  `(progn
+     (declaim (special ,name))
+     ,@(when initial-valuep
+         `((unless (boundp ',name)
+             (setq ,name ,initial-value))))
+     ,@(when docstringp
+         `((set-variable-docstring ',name ',docstring)))
+     (set-variable-source-location ',name (current-source-location (defvar ,name)) 'defvar)
+     ',name))
 
 ;;; DEFPARAMETER.
-(defmacro defparameter (name initial-value &optional docstring)
+(defmacro defparameter (name initial-value &optional (docstring nil docstringp))
+  (when docstringp
+    (check-type docstring string))
   `(progn
      (declaim (special ,name))
      (setq ,name ,initial-value)
+     ,@(when docstringp
+         `((set-variable-docstring ',name ',docstring)))
+     (set-variable-source-location ',name (current-source-location (defparameter ,name)) 'defparameter)
      ',name))
 
-(defmacro defconstant (name initial-value &optional docstring)
+(defmacro defconstant (name initial-value &optional (docstring nil docstringp))
+  (when docstringp
+    (check-type docstring string))
   `(eval-when (:compile-toplevel :load-toplevel :execute)
      (%defconstant ',name ,initial-value
+                   (current-source-location (defconstant ,name))
                    ,@(when docstring `(',docstring)))))
 
 (defmacro define-symbol-macro (symbol expansion)
   `(eval-when (:compile-toplevel :load-toplevel :execute)
-     (%define-symbol-macro ',symbol ',expansion)))
+     (%define-symbol-macro ',symbol ',expansion (current-source-location (define-symbol-macro ,symbol)))))
 
-(defmacro defglobal (name &optional (initial-value nil initial-valuep) docstring)
-  (if initial-valuep
-      `(progn
-         (declaim (global ,name))
-         (unless (boundp ',name)
-           (setq ,name ,initial-value))
-         ',name)
-      `(progn
-         (declaim (global ,name))
-         ',name)))
+(defmacro defglobal (name &optional (initial-value nil initial-valuep) (docstring nil docstringp))
+  (when docstringp
+    (check-type docstring string))
+  `(progn
+     (declaim (global ,name))
+     ,@(when initial-valuep
+         `((unless (boundp ',name)
+             (setq ,name ,initial-value))))
+     ,@(when docstringp
+         `((set-variable-docstring ',name ',docstring)))
+     (set-variable-source-location ',name (current-source-location (defglobal ,name)) 'defglobal)
+     ',name))
 
 (defmacro defun (&environment env name lambda-list &body body)
   (let ((base-name (if (consp name)
                        (second name)
                        name)))
-  (multiple-value-bind (body-forms declares docstring)
-      (parse-declares body :permit-docstring t)
-    (let ((the-lambda `(lambda ,lambda-list
-                         (declare ,@declares
-                                  (lambda-name ,name))
-                         ,docstring
-                         (block ,base-name ,@body-forms))))
-      `(progn
-         (eval-when (:compile-toplevel :load-toplevel :execute)
-           ;; Don't emit source information if there's an environment.
-           ;; Currently inlining a DEFUN defined in a macrolet doesn't work.
-           (%compiler-defun ',name ',(if env 'nil the-lambda)))
-         (%defun ',name ,the-lambda)
-         ',name)))))
+    (multiple-value-bind (body-forms declares docstring)
+        (parse-declares body :permit-docstring t)
+      (let ((the-lambda `(lambda ,lambda-list
+                           (declare ,@declares
+                                    (lambda-name ,name))
+                           ,docstring
+                           (block ,base-name ,@body-forms))))
+        `(progn
+           (eval-when (:compile-toplevel :load-toplevel :execute)
+             ;; Don't emit source information if there's an environment.
+             ;; Currently inlining a DEFUN defined in a macrolet doesn't work.
+             (%compiler-defun ',name ',(if env 'nil the-lambda)))
+           (%defun ',name ,the-lambda ',docstring)
+           ',name)))))
+
+;; Like DEFUN, but behave as though the function is defined in the empty
+;; environment for the purposes of inlining.
+;; This is to work around DEFUN not being able to inline functions
+;; that are wrapped in a MACROLET.
+(defmacro defun* (name lambda-list &body body)
+  (macroexpand-1 `(defun ,name ,lambda-list ,@body) nil))
 
 (defmacro prog (variables &body body)
   (multiple-value-bind (body-forms declares)
@@ -510,3 +552,14 @@
   (if vars
       `(values (setf (values ,@vars) ,form))
       `(values ,form)))
+
+(defmacro unwind-protect-unwind-only (protected-form &body cleanup-forms)
+  "Like UNWIND-PROTECT, but CLEANUP-FORMS are not executed if a normal return occurs."
+  (let ((abnormal-return (gensym "ABNORMAL-RETURN")))
+    `(let ((,abnormal-return t))
+       (unwind-protect
+            (multiple-value-prog1
+                ,protected-form
+              (setf ,abnormal-return nil))
+         (when ,abnormal-return
+           ,@cleanup-forms)))))

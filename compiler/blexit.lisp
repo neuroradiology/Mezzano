@@ -1,17 +1,15 @@
-;;;; Copyright (c) 2017 Henry Harrington <henry.harrington@gmail.com>
-;;;; This code is licensed under the MIT license.
+;;;; Removal of redundant return-from forms.
+;;;;
+;;;; This pass tracks which blocks are active along the tail position.
+;;;; When a return-from is reached whose target is active, it can be
+;;;; reduced down to just the value.
 
-;;; Removal of redundant return-from forms.
-;;;
-;;; This pass tracks which blocks are active along the tail position.
-;;; When a return-from is reached whose target is active, it can be
-;;; reduced down to just the value.
-
-(in-package :sys.c)
+(in-package :mezzano.compiler)
 
 (defgeneric blexit-1 (form live-block-list))
 
-(defun blexit (lambda)
+(defun blexit (lambda architecture)
+  (declare (ignore architecture))
   (blexit-1 lambda '()))
 
 (defmethod blexit-1 ((form lexical-variable) live-block-list)

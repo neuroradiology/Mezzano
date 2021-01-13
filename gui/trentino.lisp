@@ -15,7 +15,8 @@
    (%font :initarg :font :reader font)
    (%frame :initarg :frame :reader frame)))
 
-(defgeneric dispatch-event (viewer event))
+(defgeneric dispatch-event (viewer event)
+  (:method (viewer event) nil))
 
 (defmethod dispatch-event (window (event null)))
 
@@ -136,7 +137,7 @@
 			  (video-width (cl-video:width container))
 			  (video-height (cl-video:height container))
 			  (quit nil))
-
+                     (setf (mezzano.gui.compositor:name window) viewer)
 		     ;; Handling the window events in own thread
 		     (mezzano.supervisor:make-thread
 		      #'(lambda ()

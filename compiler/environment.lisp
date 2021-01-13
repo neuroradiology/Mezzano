@@ -1,4 +1,6 @@
-(in-package :sys.c)
+;;;; Environment introspection and modification.
+
+(in-package :mezzano.compiler)
 
 (defclass symbol-macro ()
   ((%name :initarg :name :accessor name)
@@ -25,6 +27,7 @@
 (defgeneric macro-function-in-environment (symbol environment))
 (defgeneric lookup-variable-declared-type-in-environment (symbol environment))
 (defgeneric optimize-qualities-in-environment (environment))
+(defgeneric inline-qualities-in-environment (environment))
 
 ;;; Lexical environments.
 
@@ -90,7 +93,11 @@
       (dolist (func functions)
         (when (not (assoc (first func) new-decls :test #'equal))
           (push (list (first func) nil) new-decls)))
-      (setf (slot-value sub '%inline-decls) (append new-decls (slot-value environment '%inline-decls))))
+      (setf (slot-value sub '%inline-decls) (append new-decls
+                                                    (set-difference (slot-value environment '%inline-decls)
+                                                                    new-decls
+                                                                    :test #'equal
+                                                                    :key #'first))))
     (let ((new-decls '()))
       (flet ((add-decl (name type)
                (let* ((new-var (assoc name variables))
@@ -101,23 +108,31 @@
                                         symbol-macro)
                                     (if new-var
                                         type
-                                        (let ((old-type (lookup-variable-declared-type-in-environment name environment)))
-                                          (if (eql old-type 't)
-                                              type
-                                              `(and ,type ,old-type)))))
+                                        (merge-the-types
+                                         (lookup-variable-declared-type-in-environment name environment)
+                                         type)))
                                    (special-variable
-                                    (let ((old-type (mezzano.runtime::symbol-type name)))
-                                      (if (eql old-type 't)
-                                          type
-                                          `(and ,type ,old-type)))))))
-                 (when (assoc name new-decls :key #'name)
-                   (error "Multiple type declarations for ~S." name))
+                                    (merge-the-types
+                                     (mezzano.runtime::symbol-type name)
+                                     type)))))
+                 (let ((existing (assoc name new-decls :key #'name)))
+                   (when existing
+                     (warn 'sys.int::simple-style-warning
+                           :format-control "Multiple type declarations at same scope for ~S."
+                           :format-arguments (list name))
+                     ;; Merge the two types together.
+                     (unless (compiler-type-equal-p real-type (second existing))
+                       (setf (second existing)
+                             (merge-the-types (second existing) real-type)))))
                  (push (list actual-var real-type) new-decls))))
         (loop
            for (what type . names) in declarations
-           ;; TODO: Pick up (declare (fixnum ...)) and similar.
            when (eql what 'type)
            do (loop for name in names do (add-decl name type)))
+        (loop
+           for (what . names) in declarations
+           when (non-type-type-declaration-p what)
+           do (loop for name in names do (add-decl name what)))
         (loop
            for (name var) in variables
            when (and (typep var 'lexical-variable)
@@ -216,3 +231,6 @@
 
 (defmethod optimize-qualities-in-environment ((environment lexical-environment))
   (slot-value environment '%optimize))
+
+(defmethod inline-qualities-in-environment ((environment lexical-environment))
+  (slot-value environment '%inline-decls))

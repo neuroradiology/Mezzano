@@ -12,7 +12,9 @@
 (proclaim '(special *string* *used-args* *used-outer-args* *used-initial*
                     *get-arg-carefully* *inner-end* *outer-end* *at-top*))
 
-(defvar *fn-table* (make-hash-table) "used to access fns for commands")
+;; Probably safe to make unsynchronized-gc-invariant...
+(defvar *fn-table* (make-hash-table :synchronized t)
+  "used to access fns for commands")
 
 ;Each of these functions expect to get called with two arguments
 ;start and end.  Start points to the first character after the ~
@@ -111,7 +113,7 @@
 
 (defmacro formatter (string)
   `(lambda (s &rest args)
-     (declare (sys.int::lambda-name (formatter ,string)))
+     (declare (mezzano.internals::lambda-name (formatter ,string)))
      (formatter-in-package ,string "CL-USER")))
 
 (defvar *errors-are-errors* t)
@@ -121,6 +123,7 @@
     (or (catch :format-compilation-error
           `(apply #'maybe-initiate-xp-printing
                   (lambda (xp &rest args)
+                    (declare (ignorable xp args))
                     ,@(bind-initial
                        `((block top
                            ,@(let ((*get-arg-carefully* nil)
@@ -344,25 +347,27 @@
                (funcall (symbol-function ',fn) xp ,(get-arg) ,colon ,atsign ,@ vars)))))))
 
 ;; TODO: Process mincol,colinc,minpad,padchar.
-(defun impl-A/S (start end escape-value)
+(defun impl-A/S (start end escape-value readably-is-nil)
   (declare (ignore end))
   (multiple-value-bind (colon atsign params)
       (parse-params start '(0 1 0 #\Space))
-    (declare (ignore atsign params))
-    (if colon
-        `(let ((*print-escape* ,escape-value)
-               (arg ,(get-arg)))
-           (if arg
-               (write+ arg XP)
-               (write-string++ "()" XP 0 2)))
-        `(let ((*print-escape* ,escape-value))
-           (write+ ,(get-arg) XP)))))
+    (declare (ignore atsign))
+    `(let ((*print-escape* ,escape-value)
+           ,@(when readably-is-nil
+               `((*print-readably* nil))))
+       ,@params
+       ,(if colon
+            `(let ((arg ,(get-arg)))
+               (if arg
+                   (write+ arg XP)
+                   (write-string++ "()" XP 0 2)))
+            `(write+ ,(get-arg) XP)))))
 
 (def-format-handler #\A (start end)
-  (impl-A/S start end nil))
+  (impl-A/S start end nil t))
 
 (def-format-handler #\S (start end)
-  (impl-A/S start end t))
+  (impl-A/S start end t nil))
 
 ;The basic Format directives "DBOXRCFEG$".  The key thing about all of
 ;these directives is that they just get a single arg and print a chunk of
@@ -376,7 +381,7 @@
   (multiple-value-bind (colon atsign params)
       (parse-params start '(nil #\Space #\, 3))
     `(let ((the-params (list ,@params)))
-       (sys.format::format-integer XP ,(get-arg) ,base the-params ',atsign ',colon))))
+       (mezzano.format::format-integer XP ,(get-arg) ,base the-params ',atsign ',colon))))
 
 (def-format-handler #\D (start end) (impl-integer start end 10))
 (def-format-handler #\B (start end) (impl-integer start end 2))
@@ -394,23 +399,112 @@
     `(let ((the-params ,(if (eql (first params) :no-parameters-specified)
                             '()
                             `(list ,@params))))
-       (sys.format::format-radix XP
-                                 ,(get-arg)
-                                 the-params
-                                 ',atsign
-                                 ',colon))))
+       (mezzano.format::format-radix XP
+                                     ,(get-arg)
+                                     the-params
+                                     ',atsign
+                                     ',colon))))
 
 (def-format-handler #\C (start end)
   (declare (ignore end))
   (multiple-value-bind (colon atsign)
       (parse-params start '())
-    `(sys.format::format-character XP ,(get-arg) ',atsign ',colon)))
+    `(mezzano.format::format-character XP ,(get-arg) ',atsign ',colon)))
 
-;; TODO.
-(def-format-handler #\F (start end) (impl-integer start end 10))
-(def-format-handler #\E (start end) (impl-integer start end 10))
-(def-format-handler #\G (start end) (impl-integer start end 10))
-(def-format-handler #\$ (start end) (impl-integer start end 10))
+(defun format-float (stream object params atsign colon)
+  (declare (ignore atsign colon))
+  (let ((w (first params))
+        (d (second params))
+        (k (or (third params) 0))
+        (overflowchar (fourth params))
+        (padchar (or (fifth params) #\Space)))
+    ;; TODO.
+    (declare (ignore d k overflowchar padchar))
+    (let ((*print-escape* nil)
+          (*print-readably* nil))
+      (if (realp object)
+          (mezzano.internals::write-float (float object) stream)
+          ;; Format as if by ~wD
+          (mezzano.format::format-integer stream object 10 (list w) nil nil)))))
+
+(def-format-handler #\F (start end)
+  (declare (ignore end))
+  (multiple-value-bind (colon atsign params)
+      (parse-params start '(nil nil 0 nil #\Space))
+    `(let ((the-params (list ,@params)))
+       (format-float XP ,(get-arg) the-params ',atsign ',colon))))
+
+(defun format-exponent (stream object params atsign colon)
+  (declare (ignore atsign colon))
+  (let ((w (first params))
+        (d (second params))
+        (e (third params))
+        (k (or (fourth params) 1))
+        (overflowchar (fifth params))
+        (padchar (or (sixth params) #\Space))
+        (exponentchar (seventh params)))
+    ;; TODO.
+    (declare (ignore d e k overflowchar padchar exponentchar))
+    (let ((*print-escape* nil)
+          (*print-readably* nil))
+      (if (realp object)
+          (mezzano.internals::write-float (float object) stream)
+          ;; Format as if by ~wD
+          (mezzano.format::format-integer stream object 10 (list w) nil nil)))))
+
+(def-format-handler #\E (start end)
+  (declare (ignore end))
+  (multiple-value-bind (colon atsign params)
+      (parse-params start '(nil nil nil 1 nil nil nil))
+    `(let ((the-params (list ,@params)))
+       (format-exponent XP ,(get-arg) the-params ',atsign ',colon))))
+
+(defun format-general-float (stream object params atsign colon)
+  (declare (ignore atsign colon))
+  (let ((w (first params))
+        (d (second params))
+        (e (third params))
+        (k (or (fourth params) 1))
+        (overflowchar (fifth params))
+        (padchar (or (sixth params) #\Space))
+        (exponentchar (seventh params)))
+    ;; TODO.
+    (declare (ignore d e k overflowchar padchar exponentchar))
+    (let ((*print-escape* nil)
+          (*print-readably* nil))
+      (if (realp object)
+          (mezzano.internals::write-float (float object) stream)
+          ;; Format as if by ~wD
+          (mezzano.format::format-integer stream object 10 (list w) nil nil)))))
+
+(def-format-handler #\G (start end)
+  (declare (ignore end))
+  (multiple-value-bind (colon atsign params)
+      (parse-params start '(nil nil nil 1 nil nil nil))
+    `(let ((the-params (list ,@params)))
+       (format-general-float XP ,(get-arg) the-params ',atsign ',colon))))
+
+(defun format-monetary (stream object params atsign colon)
+  (declare (ignore atsign colon))
+  (let ((d (or (first params) 2))
+        (e (or (second params) 1))
+        (w (or (third params) 0))
+        (padchar (or (fourth params) #\Space)))
+    ;; TODO.
+    (declare (ignore d e padchar))
+    (let ((*print-escape* nil)
+          (*print-readably* nil))
+      (if (realp object)
+          (mezzano.internals::write-float (float object) stream)
+          ;; Format as if by ~wD
+          (mezzano.format::format-integer stream object 10 (list w) nil nil)))))
+
+(def-format-handler #\$ (start end)
+  (declare (ignore end))
+  (multiple-value-bind (colon atsign params)
+      (parse-params start '(2 1 0 #\Space))
+    `(let ((the-params (list ,@params)))
+       (format-monetary XP ,(get-arg) the-params ',atsign ',colon))))
 
 ;Format directives that get open coded "P%&~|T*?^"
 
@@ -746,7 +840,7 @@
 
 (defun format (stream string-or-fn &rest args)
   (cond ((stringp stream)
-         (apply #'format (make-instance 'sys.int::string-output-stream
+         (apply #'format (make-instance 'mezzano.internals::string-output-stream
                                         :element-type 'character
                                         :string stream)
                 string-or-fn args)
@@ -760,13 +854,20 @@
            (apply string-or-fn stream args)
            nil)))
 
-(defvar *format-string-cache* (make-hash-table))
+(defvar *format-string-cache*
+  ;; Weak pointers check liveness using EQ, this will start forgetting
+  ;; entries when there are no references to the original strings.
+  (make-hash-table :test #'equal
+                   :synchronized t
+                   :weakness :key))
 (defvar *compiling-format-string* nil)
 
 (defun compile-format-string (string)
   (let ((form `(lambda (s &rest args)
-                 (declare (sys.int::lambda-name (formatter ,string)))
-                 ,(formatter-fn string "CL-USER" t))))
+                 (declare (mezzano.internals::lambda-name (formatter ,string)))
+                 ,(formatter-fn string "CL-USER" t)))
+        (mezzano.compiler::*trace-asm* nil)
+        (mezzano.compiler.backend::*shut-up* t))
     (cond (*compiling-format-string*
            (values (mezzano.full-eval:eval-in-lexenv form nil) nil))
           (t
@@ -779,7 +880,6 @@
              (when (or (not value) (and force-fn? (stringp value)))
                (when (> (hash-table-count *format-string-cache*) 1000)
                  ;; Keep the size of the cache down.
-                 ;; TODO: Use a weak hash table.
                  (clrhash *format-string-cache*))
                (multiple-value-bind (fn cachep)
                    (compile-format-string string-or-fn)

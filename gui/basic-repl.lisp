@@ -1,12 +1,16 @@
-;;;; Copyright (c) 2011-2016 Henry Harrington <henry.harrington@gmail.com>
-;;;; This code is licensed under the MIT license.
+;;;; A very simple Lisp REPL, with minimal line editing support.
+
+(defpackage :mezzano.gui.basic-repl
+  (:use :cl)
+  (:local-nicknames (:sys.int :mezzano.internals))
+  (:export #:spawn))
 
 (in-package :mezzano.gui.basic-repl)
 
-(defclass basic-repl (sys.gray:unread-char-mixin
+(defclass basic-repl (mezzano.gray:unread-char-mixin
                       sys.int::simple-edit-mixin
-                      sys.gray:fundamental-character-input-stream
-                      sys.gray:fundamental-character-output-stream)
+                      mezzano.gray:fundamental-character-input-stream
+                      mezzano.gray:fundamental-character-output-stream)
   ((%fifo :initarg :fifo :reader fifo)
    (%window :initarg :window :reader window)
    (%thread :initarg :thread :reader thread)
@@ -20,8 +24,8 @@
                      :x 0
                      :y 0
                      :line 0
-                     :foreground-colour mezzano.gui:*default-foreground-colour*
-                     :background-colour mezzano.gui:*default-background-colour*))
+                     :foreground-colour mezzano.gui.theme:*foreground*
+                     :background-colour mezzano.gui.theme:*background*))
 
 (defgeneric dispatch-event (window event)
   ;; Eat unknown events.
@@ -43,7 +47,7 @@
          (return))
        (dispatch-event window evt))))
 
-(defmethod sys.gray:stream-read-char ((stream basic-repl))
+(defmethod mezzano.gray:stream-read-char ((stream basic-repl))
   (loop
      ;; Catch up with window manager events.
      (pump-event-loop stream)
@@ -54,7 +58,7 @@
      ;; Block until the next window event.
      (dispatch-event stream (mezzano.supervisor:fifo-pop (fifo stream)))))
 
-(defmethod sys.gray:stream-terpri ((stream basic-repl))
+(defmethod mezzano.gray:stream-terpri ((stream basic-repl))
   ;; Catch up with window manager events.
   (pump-event-loop stream)
   (let* ((x (cursor-x stream))
@@ -84,19 +88,18 @@
              (mezzano.gui::2d-array-bitset 16 win-width (background-colour stream) fb y 0)
              (mezzano.gui.compositor:damage-window window 0 y win-width 16)))))
 
-(defmethod sys.gray:stream-write-char ((stream basic-repl) character)
+(defmethod mezzano.gray:stream-write-char ((stream basic-repl) character)
   ;; Catch up with window manager events.
   (pump-event-loop stream)
   (cond
     ((eql character #\Newline)
-     (sys.gray:stream-terpri stream))
+     (mezzano.gray:stream-terpri stream))
     (t (let* ((width (sys.int::unifont-glyph-width character))
               (window (window stream))
               (fb (mezzano.gui::surface-pixels (mezzano.gui.compositor:window-buffer window)))
-              (win-width (mezzano.gui.compositor:width window))
-              (win-height (mezzano.gui.compositor:height window)))
+              (win-width (mezzano.gui.compositor:width window)))
          (when (> (+ (cursor-x stream) width) win-width)
-           (sys.gray:stream-terpri stream))
+           (mezzano.gray:stream-terpri stream))
          (let ((x (cursor-x stream))
                (y (cursor-y stream))
                (glyph (sys.int::map-unifont-2d character)))
@@ -108,10 +111,10 @@
            (mezzano.gui.compositor:damage-window window x y width 16)
            (incf (cursor-x stream) width))))))
 
-(defmethod sys.gray:stream-start-line-p ((stream basic-repl))
+(defmethod mezzano.gray:stream-start-line-p ((stream basic-repl))
   (zerop (cursor-x stream)))
 
-(defmethod sys.gray:stream-line-column ((stream basic-repl))
+(defmethod mezzano.gray:stream-line-column ((stream basic-repl))
   (truncate (cursor-x stream) 8))
 
 (defmethod sys.int::stream-cursor-pos ((stream basic-repl))
@@ -134,7 +137,6 @@
   (unless initial-y (setf initial-y (+ (cursor-line stream)
                                        (cursor-y stream))))
   (do* ((window (window stream))
-        (framebuffer (mezzano.gui.compositor:window-buffer window))
         (win-width (mezzano.gui.compositor:width window))
         (win-height (mezzano.gui.compositor:height window))
         (i start (1+ i)))
@@ -155,7 +157,6 @@
   (let* ((window (window stream))
          (framebuffer (mezzano.gui::surface-pixels (mezzano.gui.compositor:window-buffer window)))
          (win-width (mezzano.gui.compositor:width window))
-         (win-height (mezzano.gui.compositor:height window))
          (colour (background-colour stream)))
     (setf start-y (- start-y (cursor-line stream))
           end-y (- end-y (cursor-line stream)))
@@ -178,6 +179,9 @@
                                          framebuffer end-y 0)
            (mezzano.gui.compositor:damage-window window 0 end-y end-x 16)))))
 
+(defmethod interactive-stream-p ((stream basic-repl))
+  't)
+
 (defun repl-main (&key width height)
   (let* ((fifo (mezzano.supervisor:make-fifo 50))
          (window (mezzano.gui.compositor:make-window fifo (or width 640) (or height 480)))
@@ -193,6 +197,7 @@
          (*query-io* *standard-input*)
          (*trace-output* *standard-input*)
          (*debug-io* *standard-input*))
+    (setf (mezzano.gui.compositor:name window) term)
     (mezzano.gui::2d-array-bitset (mezzano.gui.compositor:height window)
                                   (mezzano.gui.compositor:width window)
                                   (background-colour term)
@@ -208,5 +213,3 @@
 (defun spawn (&rest args)
   (mezzano.supervisor:make-thread (lambda () (apply #'repl-main args))
                                   :name "Lisp Listener"))
-
-(spawn)

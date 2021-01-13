@@ -1,9 +1,6 @@
-;;;; Copyright (c) 2011-2016 Henry Harrington <henry.harrington@gmail.com>
-;;;; This code is licensed under the MIT license.
-
 ;;;; Function inlining.
 
-(in-package :sys.c)
+(in-package :mezzano.compiler)
 
 (defun inline-functions (lambda architecture)
   (il-form lambda architecture))
@@ -95,40 +92,40 @@
 (defun expand-inline-function (form name arg-list architecture)
   (multiple-value-bind (inlinep expansion)
       (function-inline-info name)
-    (when (and inlinep
-               ;; Don't inline builtin functions.
-               ;; There may be inlinable definitions available, but they're for the new compiler.
-               (not (gethash name (ecase architecture
-                                    (:x86-64 mezzano.compiler.codegen.x86-64::*builtins*)
-                                    (:arm64 mezzano.compiler.codegen.arm64::*builtins*)))))
-      (cond (expansion
-             (ast `(call mezzano.runtime::%funcall
-                         ,(pass1-lambda expansion
-                                        (extend-environment
-                                         nil
-                                         :declarations `((optimize ,@(loop for (quality value) on (ast-optimize form) by #'cddr
-                                                                        collect (list quality value))))))
-                         ,@arg-list)
-                  form))
-            ((fboundp name)
-             (multiple-value-bind (expansion closurep)
-                 (function-lambda-expression (fdefinition name))
-               (when (and expansion (not closurep))
-                 (ast `(call mezzano.runtime::%funcall
-                             ,(pass1-lambda expansion
-                                            (extend-environment
-                                             nil
-                                             :declarations `((optimize ,@(loop for (quality value) on (ast-optimize form) by #'cddr
-                                                                            collect (list quality value))))))
-                             ,@arg-list)
-                      form))))))))
+    (when (and (or inlinep
+                   (eql (second (assoc name (ast-inline-declarations form))) 'inline))
+               (not (eql (second (assoc name (ast-inline-declarations form))) 'notinline)))
+      (flet ((make-inline-environment ()
+               (extend-environment
+                nil
+                :declarations `((optimize ,@(loop for (quality value) on (ast-optimize form) by #'cddr
+                                               collect (list quality value)))
+                                (notinline ,@(loop for (name mode) in (ast-inline-declarations form)
+                                                  when (eql mode 'notinline)
+                                                  collect name))
+                                (inline ,@(loop for (name mode) in (ast-inline-declarations form)
+                                             when (eql mode 'inline)
+                                             collect name))))))
+        (cond (expansion
+               (ast `(call mezzano.runtime::%funcall
+                           ,(pass1-lambda expansion (make-inline-environment))
+                           ,@arg-list)
+                    form))
+              ((fboundp name)
+               (multiple-value-bind (expansion closurep)
+                   (function-lambda-expression (fdefinition name))
+                 (when (and expansion (not closurep))
+                   (ast `(call mezzano.runtime::%funcall
+                               ,(pass1-lambda expansion (make-inline-environment))
+                               ,@arg-list)
+                        form)))))))))
 
 (defmethod il-form ((form ast-call) architecture)
   (il-implicit-progn (arguments form) architecture)
   (let ((inlined-form (expand-inline-function form (name form) (arguments form) architecture)))
     (cond (inlined-form
            (change-made)
-           inlined-form)
+           (il-form inlined-form architecture))
           (t form))))
 
 (defmethod il-form ((form lexical-variable) architecture)

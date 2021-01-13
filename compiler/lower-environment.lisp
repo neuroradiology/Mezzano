@@ -1,6 +1,3 @@
-;;;; Copyright (c) 2011-2016 Henry Harrington <henry.harrington@gmail.com>
-;;;; This code is licensed under the MIT license.
-
 ;;;; Lower non-local lexical variable accesses so they refer directly
 ;;;; to environment objects.
 ;;;; This is done in two passes.
@@ -10,7 +7,7 @@
 ;;;; rewrites the code.
 ;;;; Vectors are created at LAMBDA and TAGBODY nodes.
 
-(in-package :sys.c)
+(in-package :mezzano.compiler)
 
 (defvar *environment-chain*)
 (defvar *environment-layout*)
@@ -24,6 +21,7 @@
 (defvar *current-closure-set*)
 
 (defun lower-environment (lambda)
+  (detect-uses lambda)
   (let ((*environment-layout* (make-hash-table))
         (*environment-layout-dx* (make-hash-table))
         (*allow-dx-environment* 't)
@@ -183,8 +181,6 @@ Keyword arguments, non-constant init-forms and special variables are disallowed.
          (assert (lexical-variable-p suppliedp))))
   (when (lambda-information-rest-arg lambda)
     (assert (lexical-variable-p (lambda-information-rest-arg lambda))))
-  (when (lambda-information-fref-arg lambda)
-    (assert (lexical-variable-p (lambda-information-fref-arg lambda))))
   (when (lambda-information-closure-arg lambda)
     (assert (lexical-variable-p (lambda-information-closure-arg lambda))))
   (when (lambda-information-count-arg lambda)
@@ -208,8 +204,6 @@ Keyword arguments, non-constant init-forms and special variables are disallowed.
           (maybe-add-environment-variable (third arg))))
       (when (lambda-information-rest-arg lambda)
         (maybe-add-environment-variable (lambda-information-rest-arg lambda)))
-      (when (lambda-information-fref-arg lambda)
-        (maybe-add-environment-variable (lambda-information-fref-arg lambda)))
       (when (lambda-information-closure-arg lambda)
         (maybe-add-environment-variable (lambda-information-closure-arg lambda)))
       (when (lambda-information-count-arg lambda)
@@ -312,8 +306,6 @@ Keyword arguments, non-constant init-forms and special variables are disallowed.
                          (list (lambda-information-rest-arg form)))
                        (when (lambda-information-environment-arg form)
                          (list (lambda-information-environment-arg form)))
-                       (when (lambda-information-fref-arg form)
-                         (list (lambda-information-fref-arg form)))
                        (when (lambda-information-closure-arg form)
                          (list (lambda-information-closure-arg form)))
                        (when (lambda-information-count-arg form)
@@ -521,7 +513,11 @@ Keyword arguments, non-constant init-forms and special variables are disallowed.
        form))
 
 (defmethod lower-env-form ((form lexical-variable))
-  (if (localp form)
+  (if (or (localp form)
+          ;; A lexical defined in the current environment that isn't written
+          ;; to can be refered to directly.
+          (and (eql (lexical-variable-definition-point form) *current-lambda*)
+               (zerop (lexical-variable-write-count form))))
       form
       (dolist (e *environment*
                (error "Can't find variable ~S in environment." form))
@@ -539,7 +535,7 @@ Keyword arguments, non-constant init-forms and special variables are disallowed.
         (local-env (gethash lambda *environment-layout*))
         (*current-lambda* lambda)
         (*environment-allocation-mode* (let* ((declares (getf (lambda-information-plist lambda) :declares))
-                                              (mode (assoc 'sys.c::closure-allocation declares)))
+                                              (mode (assoc 'closure-allocation declares)))
                                          (if (and mode (cdr mode))
                                              (second mode)
                                              *environment-allocation-mode*))))
@@ -590,9 +586,6 @@ Keyword arguments, non-constant init-forms and special variables are disallowed.
                                ,@(when (and (lambda-information-rest-arg lambda)
                                             (not (localp (lambda-information-rest-arg lambda))))
                                        (list (set-var (lambda-information-rest-arg lambda))))
-                               ,@(when (and (lambda-information-fref-arg lambda)
-                                            (not (localp (lambda-information-fref-arg lambda))))
-                                       (list (set-var (lambda-information-fref-arg lambda))))
                                ,@(when (and (lambda-information-closure-arg lambda)
                                             (not (localp (lambda-information-closure-arg lambda))))
                                        (list (set-var (lambda-information-closure-arg lambda))))
@@ -612,7 +605,7 @@ Keyword arguments, non-constant init-forms and special variables are disallowed.
            (lower-env-lambda form)))
         ((and (getf (lambda-information-plist form) 'declared-dynamic-extent)
               (not *perform-tce*))
-         (ast `(call sys.c::make-dx-closure
+         (ast `(call make-dx-closure
                      ,(lower-env-lambda form)
                      ,(second (first *environment-chain*)))
               form))
@@ -645,7 +638,7 @@ Keyword arguments, non-constant init-forms and special variables are disallowed.
 (defun generate-make-environment (lambda size)
   (ast (cond ((gethash lambda *environment-layout-dx*)
               ;; DX allocation.
-              `(call sys.c::make-dx-simple-vector (quote ,size)))
+              `(call make-dx-simple-vector (quote ,size)))
              (*environment-allocation-mode*
               ;; Allocation in an explicit area.
               `(call sys.int::make-simple-vector (quote ,size) (quote ,*environment-allocation-mode*)))

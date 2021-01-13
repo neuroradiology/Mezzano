@@ -1,15 +1,14 @@
-;;;; Copyright (c) 2011-2016 Henry Harrington <henry.harrington@gmail.com>
-;;;; This code is licensed under the MIT license.
-
-;;; The full evaluator, interprets all forms.
+;;;; The full evaluator, interprets all forms.
 
 (defpackage :mezzano.full-eval
   (:export #:eval-in-lexenv)
+  (:local-nicknames (:c :mezzano.compiler)
+                    (:sys.int :mezzano.internals))
   (:use :cl))
 
 (in-package :mezzano.full-eval)
 
-(defparameter *special-forms* (make-hash-table))
+(defparameter *special-forms* (make-hash-table :synchronized t))
 
 (defmacro defspecial (name lambda-list &body body)
   (let ((form-sym (gensym))
@@ -28,10 +27,10 @@
 
 (defun find-variable (symbol env)
   "Locate SYMBOL in ENV. Returns a binding list or the symbol if there was no lexical binding."
-  (sys.c::lookup-variable-in-environment symbol env))
+  (c::lookup-variable-in-environment symbol env))
 
 (defun find-function (name env)
-  (let ((local-fn (sys.c::lookup-function-in-environment name env)))
+  (let ((local-fn (c::lookup-function-in-environment name env)))
     (cond ((functionp local-fn)
            ;; Macro function.
            (error "~S names a macro." name))
@@ -104,7 +103,7 @@
                  (let ((env outer-env))
                    (flet ((bind-one (name value)
                             (setf env
-                                  (sys.c::extend-environment
+                                  (c::extend-environment
                                    env
                                    :variables (list (list name (make-instance 'lexical-variable :name name :value value)))))))
                      (dolist (arg required)
@@ -162,7 +161,7 @@
 
 (defun eval-locally-body (declares body env)
   "Collect all special declarations and add them to the environment."
-  (eval-progn-body body (sys.c::extend-environment env :declarations declares)))
+  (eval-progn-body body (c::extend-environment env :declarations declares)))
 
 (defun frob-flet-function (definition env)
   (destructuring-bind (name lambda-list &body body) definition
@@ -179,20 +178,21 @@
                          env)))))
 
 (defspecial block (&environment env name &body body)
-  (let ((env (sys.c::extend-environment
+  (let ((env (c::extend-environment
               env
               :blocks (list (list name (lambda (values)
                                          (return-from block (values-list values))))))))
     (eval-progn-body body env)))
 
 (defspecial return-from (&environment env name &optional value)
-  (let ((target (or (sys.c::lookup-block-in-environment name env)
+  (let ((target (or (c::lookup-block-in-environment name env)
                     (error "No block named ~S." name))))
     (funcall target (multiple-value-list (eval-in-lexenv value env)))))
 
 (defspecial eval-when (&environment env situation &body body)
   (multiple-value-bind (compile load eval)
       (sys.int::parse-eval-when-situation situation)
+    (declare (ignore compile load))
     (when eval
       (eval-progn-body body env))))
 
@@ -207,7 +207,7 @@
                                               :name name
                                               :value fn))))
                               definitions))
-           (env (sys.c::extend-environment
+           (env (c::extend-environment
                  env
                  :functions functions
                  :declarations declares)))
@@ -233,7 +233,7 @@
                                               :name name
                                               :value nil))))
                               definitions))
-           (env (sys.c::extend-environment
+           (env (c::extend-environment
                  env
                  :functions functions
                  :declarations declares)))
@@ -242,6 +242,7 @@
          for (name var) in functions
          do (multiple-value-bind (name fn)
                 (frob-flet-function def env)
+              (declare (ignore name))
               (setf (variable-value var) fn)))
       (eval-progn-body body env))))
 
@@ -252,8 +253,8 @@
 
 (defun make-variable (name declares)
   (if (or (sys.int::variable-information name)
-          (sys.c::declared-as-p 'special name declares))
-      (make-instance 'sys.c::special-variable :name name)
+          (c::declared-as-p 'special name declares))
+      (make-instance 'c::special-variable :name name)
       (make-instance 'lexical-variable
                      :name name)))
 
@@ -267,7 +268,7 @@
                                                (make-variable name declares)
                                                (eval-in-lexenv init-form env))))
                                      bindings))
-           (env (sys.c::extend-environment env
+           (env (c::extend-environment env
                                            :variables (loop for (name var init-form) in names-and-values
                                                          collect (list name var))
                                            :declarations declares))
@@ -275,7 +276,7 @@
            (special-values '()))
       (loop for (name var init-value) in names-and-values do
            (etypecase var
-             (sys.c::special-variable
+             (c::special-variable
               (push name special-variables)
               (push init-value special-values))
              (lexical-variable
@@ -293,20 +294,20 @@
                      (let ((value (eval-in-lexenv init-form env)))
                        (ecase (sys.int::symbol-mode name)
                          ((nil :symbol-macro)
-                          (cond ((sys.c::declared-as-p 'special name declares)
+                          (cond ((c::declared-as-p 'special name declares)
                                  (progv (list name) (list value)
                                    (bind-one (rest bindings)
-                                             (sys.c::extend-environment env :variables (list (list name (make-instance 'sys.c::special-variable :name name)))))))
+                                             (c::extend-environment env :variables (list (list name (make-instance 'c::special-variable :name name)))))))
                                 (t
                                  (let ((var (make-instance 'lexical-variable :name name :value value)))
                                    (bind-one (rest bindings)
-                                             (sys.c::extend-environment env :variables (list (list name var))))))))
+                                             (c::extend-environment env :variables (list (list name var))))))))
                          (:special
                           (progv (list name) (list value)
                             (bind-one (rest bindings)
-                                      (sys.c::extend-environment env :variables (list (list name (make-instance 'sys.c::special-variable :name name)))))))
+                                      (c::extend-environment env :variables (list (list name (make-instance 'c::special-variable :name name)))))))
                          (:constant (error "Cannot bind over constant ~S." name)))))
-                   (eval-progn-body body (sys.c::extend-environment env :declarations declares)))))
+                   (eval-progn-body body (c::extend-environment env :declarations declares)))))
       (bind-one bindings env))))
 
 (defspecial multiple-value-call (&environment env function-form &rest forms)
@@ -332,9 +333,9 @@
     (flet ((set-one (symbol value)
              (let ((var (find-variable symbol env)))
                (etypecase var
-                 (sys.c::special-variable
+                 (c::special-variable
                   (setf (symbol-value symbol) (eval-in-lexenv value env)))
-                 (sys.c::symbol-macro
+                 (c::symbol-macro
                   (eval-in-lexenv `(setf ,symbol ,value) env))
                  (lexical-variable
                   (setf (variable-value var) (eval-in-lexenv value env)))))))
@@ -380,7 +381,8 @@
   (multiple-value-bind (body declares)
       (sys.int::parse-declares body)
     (eval-locally-body declares body
-                       (sys.int::make-macrolet-env definitions env))))
+                       (let ((sys.int::*eval-hook* 'mezzano.full-eval:eval-in-lexenv))
+                         (sys.int::make-macrolet-env definitions env)))))
 
 (defspecial symbol-macrolet (&environment env definitions &body body)
   (multiple-value-bind (body declares)
@@ -391,7 +393,7 @@
 (defspecial tagbody (&environment env &body body)
   (let ((current body))
     (tagbody
-       (setf env (sys.c::extend-environment
+       (setf env (c::extend-environment
                   env
                   :go-tags (loop for sublist on body
                                 when (typep (first sublist) '(or symbol integer))
@@ -410,7 +412,7 @@
 
 (defspecial go (&environment env tag)
   (check-type tag (or symbol integer))
-  (funcall (or (sys.c::lookup-go-tag-in-environment tag env)
+  (funcall (or (c::lookup-go-tag-in-environment tag env)
                (error "No GO-tag named ~S." tag))))
 
 (defspecial progv (&environment env symbols values &body body)
@@ -425,7 +427,7 @@
   "3.1.2.1.1  Symbols as forms"
   (let ((var (find-variable form env)))
     (etypecase var
-      (sys.c::special-variable
+      (c::special-variable
        (restart-case (symbol-value form)
          (use-value (v)
            :interactive (lambda ()
@@ -439,8 +441,8 @@
                           (list (eval (read))))
            :report (lambda (s) (format s "Input a new value for ~S." form))
            (setf (symbol-value form) v))))
-      (sys.c::symbol-macro
-       (eval-in-lexenv (sys.c::symbol-macro-expansion var) env))
+      (c::symbol-macro
+       (eval-in-lexenv (c::symbol-macro-expansion var) env))
       (lexical-variable
        (variable-value var)))))
 

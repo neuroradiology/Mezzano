@@ -1,5 +1,6 @@
-;;;; Copyright (c) 2011-2016 Henry Harrington <henry.harrington@gmail.com>
-;;;; This code is licensed under the MIT license.
+;;;; Peek
+;;;;
+;;;; Display basic system information.
 
 (defpackage :mezzano.gui.peek
   (:use :cl)
@@ -17,17 +18,19 @@
     (#\Q "Quit" nil "Quit Peek")))
 
 (defun print-header ()
+  (format t "Commands:  ")
   (dolist (cmd *peek-commands*)
     (write-string (second cmd))
     (unless (char-equal (char (second cmd) 0) (first cmd))
-      (format t "(~S)" (first cmd)))
+      (format t "(~C)" (first cmd)))
+    (write-char #\Space)
     (write-char #\Space)))
 
 (defun peek-help ()
   (format t "      Peek help~%")
   (format t "Char~6TCommand~20TInfo~%")
   (dolist (cmd *peek-commands*)
-    (format t "~S~6T~A~20T~A~%" (first cmd) (second cmd) (fourth cmd))))
+    (format t "  ~C~6T ~A~20T~A~%" (first cmd) (second cmd) (fourth cmd))))
 
 (defun peek-thread ()
   (format t "Thread Name~24TState~%")
@@ -45,12 +48,14 @@
 
 (defun peek-network ()
   (format t "Network cards:~%")
-  (dolist (card mezzano.network.ethernet::*cards*)
-    (let ((address (mezzano.network.ip:ipv4-interface-address card nil)))
+  (dolist (card (mezzano.sync:watchable-set-items
+                 mezzano.driver.network-card::*nics*))
+    (multiple-value-bind (address prefix-length)
+        (mezzano.network.ip:ipv4-interface-address card nil)
       (format t " ~S~%" card)
       (format t "   Mac: ~/mezzano.network.ethernet:format-mac-address/~%" (mezzano.driver.network-card:mac-address card))
       (when address
-        (format t "   IPv4 address: ~A~%" address))
+        (format t "   IPv4 address: ~A/~D~%" address prefix-length))
       (multiple-value-bind (rx-bytes rx-packets rx-errors tx-bytes tx-packets tx-errors collisions)
           (mezzano.driver.network-card:statistics card)
         (format t "   ~:D octets, ~:D packets received. ~:D RX errors.~%"
@@ -61,26 +66,39 @@
   (format t "Routing table:~%")
   (format t " Network~20TGateway~%")
   (dolist (route mezzano.network.ip::*routing-table*)
-    (format t " ~A/~D~20T~A~%"
+    (format t " ~A/~D~20T~A~@[ [~A]~]~%"
             (mezzano.network.ip::route-network route)
             (mezzano.network.ip::route-prefix-length route)
-            (mezzano.network.ip::route-gateway route)))
-  (format t "Servers:~%")
-  (dolist (server mezzano.network.tcp::*server-alist*)
-    (format t "~S  TCPv4 ~D~%" (second server) (first server)))
+            (mezzano.network.ip::route-gateway route)
+            (mezzano.network.ip::route-tag route)))
+  (format t "DNS servers:~%")
+  (loop
+     for (server . tag) in mezzano.network.dns:*dns-servers*
+     do (format t " ~A~@[ [~A]~]~%" server tag))
+  (format t "Listeners:~%")
+  (dolist (listener mezzano.network.tcp::*tcp-listeners*)
+    (format t " ~S~%" listener))
+  (format t "DHCP leases:~%")
+  (maphash (lambda (nic interaction)
+             (format t " ~S: ~S~%" nic (mezzano.network.dhcp::lease interaction)))
+           mezzano.network.dhcp::*dhcp-interactions*)
   (format t "TCPv4 connections:~%")
-  (format t " Local~8TRemote~40TState~%")
+  (format t " Local~25TRemote~50TState~%")
   (dolist (conn mezzano.network.tcp::*tcp-connections*)
-    (format t " ~D~8T~A:~D~40T~S~%"
+    (format t " ~A:~D~25T~A:~D~50T~S~%"
+            (mezzano.network.tcp::tcp-connection-local-ip conn)
             (mezzano.network.tcp::tcp-connection-local-port conn)
-            (mezzano.network.tcp::tcp-connection-remote-ip conn) (mezzano.network.tcp::tcp-connection-remote-port conn)
+            (mezzano.network.tcp::tcp-connection-remote-ip conn)
+            (mezzano.network.tcp::tcp-connection-remote-port conn)
             (mezzano.network.tcp::tcp-connection-state conn)))
   (format t "UDPv4 connections:~%")
   (format t " Local~8TRemote~%")
   (dolist (conn mezzano.network.udp::*udp-connections*)
-    (format t " ~D~8T~A:~D~%"
+    (format t " ~A:~D~25T~A:~D~%"
+            (mezzano.network.udp::local-ip conn)
             (mezzano.network.udp::local-port conn)
-            (mezzano.network.udp::remote-address conn) (mezzano.network.udp::remote-port conn))))
+            (mezzano.network.udp::remote-address conn)
+            (mezzano.network.udp::remote-port conn))))
 
 (defvar *cpuid-1-ecx-features*
   #("SSE3"
@@ -187,19 +205,21 @@
         (push (elt feature-seq i) features)))))
 
 (defun peek-cpu ()
+  (dolist (cpu mezzano.supervisor::*cpus*)
+    (format t "~S~%" cpu))
   (let ((features '())
         (extended-cpuid-max nil))
     (multiple-value-bind (cpuid-max vendor-1 vendor-3 vendor-2)
-        (sys.int::cpuid 0)
+        (mezzano.internals::cpuid 0)
       (format t "Maximum CPUID level: ~X~%" cpuid-max)
-      (format t "Vendor: ~A~%" (sys.int::decode-cpuid-vendor vendor-1 vendor-2 vendor-3))
-      (setf extended-cpuid-max (sys.int::cpuid #x80000000))
+      (format t "Vendor: ~A~%" (mezzano.internals::decode-cpuid-vendor vendor-1 vendor-2 vendor-3))
+      (setf extended-cpuid-max (mezzano.internals::cpuid #x80000000))
       (if (logbitp 31 extended-cpuid-max)
           (format t "Maximum extended CPUID level: ~X~%" extended-cpuid-max)
           (format t "Extended CPUID not supported.~%"))
       (when (>= cpuid-max 1)
         (multiple-value-bind (a b c d)
-            (sys.int::cpuid 1)
+            (mezzano.internals::cpuid 1)
           (let* ((stepping-id (ldb (byte 4 0) a))
                  (model (ldb (byte 4 4) a))
                  (family-id (ldb (byte 4 8) a))
@@ -222,7 +242,8 @@
                                 features))))
       (when (>= extended-cpuid-max #x80000001)
         (multiple-value-bind (a b c d)
-            (sys.int::cpuid #x80000001)
+            (mezzano.internals::cpuid #x80000001)
+          (declare (ignore a b))
           (setf features (nconc (scan-feature-bits *cpuid-ext-1-ecx-features* c)
                                 (scan-feature-bits *cpuid-ext-1-edx-features* d)
                                 features)))))
@@ -230,7 +251,9 @@
 
 (defun peek-disk ()
   (dolist (disk (mezzano.supervisor:all-disks))
-    (format t "~S:~%" disk)
+    (if (mezzano.supervisor:disk-name disk)
+        (format t "~S ~A:~%" disk (mezzano.supervisor:disk-name disk))
+        (format t "~S:~%" disk))
     (if (mezzano.supervisor:disk-writable-p disk)
         (format t "  Read/write.~%")
         (format t "  Read-only.~%"))
@@ -293,16 +316,17 @@
   (let* ((fb (mezzano.gui.compositor:window-buffer (window app)))
          (new-width (mezzano.gui:surface-width fb))
          (new-height (mezzano.gui:surface-height fb)))
-    (mezzano.gui.widgets:resize-text-widget (text-pane app)
-                                            fb
-                                            (nth-value 0 (mezzano.gui.widgets:frame-size (frame app)))
-                                            (nth-value 2 (mezzano.gui.widgets:frame-size (frame app)))
-                                            (- new-width
-                                               (nth-value 0 (mezzano.gui.widgets:frame-size (frame app)))
-                                               (nth-value 1 (mezzano.gui.widgets:frame-size (frame app))))
-                                            (- new-height
-                                               (nth-value 2 (mezzano.gui.widgets:frame-size (frame app)))
-                                               (nth-value 3 (mezzano.gui.widgets:frame-size (frame app))))))
+    (mezzano.gui.widgets:resize-widget
+     (text-pane app)
+     fb
+     (nth-value 0 (mezzano.gui.widgets:frame-size (frame app)))
+     (nth-value 2 (mezzano.gui.widgets:frame-size (frame app)))
+     (- new-width
+        (nth-value 0 (mezzano.gui.widgets:frame-size (frame app)))
+        (nth-value 1 (mezzano.gui.widgets:frame-size (frame app))))
+     (- new-height
+        (nth-value 2 (mezzano.gui.widgets:frame-size (frame app)))
+        (nth-value 3 (mezzano.gui.widgets:frame-size (frame app))))))
   (setf (redraw app) t))
 
 (defmethod dispatch-event (peek (event mezzano.gui.compositor:window-close-event))
@@ -347,6 +371,7 @@
                                                                    (when (not ev) (return))
                                                                    (dispatch-event peek ev)))
                                                               (apply #'mezzano.gui.compositor:damage-window window args)))))
+            (setf (mezzano.gui.compositor:name window) peek)
             (setf (slot-value peek '%text-pane) text-pane)
             (mezzano.gui.widgets:draw-frame frame)
             (mezzano.gui.compositor:damage-window window

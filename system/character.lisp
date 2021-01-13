@@ -1,7 +1,6 @@
-;;;; Copyright (c) 2011-2016 Henry Harrington <henry.harrington@gmail.com>
-;;;; This code is licensed under the MIT license.
+;;;; Common Lisp characters
 
-(in-package :sys.int)
+(in-package :mezzano.internals)
 
 (defconstant char-code-limit #x110000)
 
@@ -10,24 +9,13 @@
                   *unicode-encoding-table*
                   *unicode-name-trie*))
 
-(defun %make-character (code &optional bits)
-  (check-type code (or (integer 0 #x0010FFFF))
-              "a unicode code-point")
-  (check-type bits (or null (integer 0 15)))
-  (if (or (<= #xD800 code #xDFFF) ; UTF-16 surrogates.
-          ;; Noncharacters.
-          (<= #xFDD0 code #xFDEF)
-          (member code '#.(loop for i to #x10
-                             collect (logior (ash i 16) #xFFFE)
-                             collect (logior (ash i 16) #xFFFF))))
-      nil
-      (%%assemble-value (ash (logior code (ash (or bits 0) 21)) 4)
-                        +tag-character+)))
-
 (defconstant +char-control-bit+ #b0001)
 (defconstant +char-meta-bit+    #b0010)
 (defconstant +char-super-bit+   #b0100)
 (defconstant +char-hyper-bit+   #b1000)
+
+(defconstant +char-code+ (byte 21 6))
+(defconstant +char-bits+ (byte 4 27))
 
 (defun make-character (code &key control meta super hyper)
   (%make-character code (logior (if control +char-control-bit+ 0)
@@ -35,16 +23,9 @@
                                 (if super +char-super-bit+ 0)
                                 (if hyper +char-hyper-bit+ 0))))
 
-(defun char-int (character)
-  (check-type character character)
-  (ash (lisp-object-address character) -4))
-
-(defun code-char (code)
-  (%make-character code))
-
 (defun char-bits (character)
   (check-type character character)
-  (logand (ash (ash (lisp-object-address character) -4) -21) 15))
+  (ldb +char-bits+ (lisp-object-address character)))
 
 (defun char-bit (character bit)
   (let ((bits (char-bits character)))
@@ -77,7 +58,7 @@
       (when (cdr stores) (error "Can't expand this."))
       ;; Return the setf expansion for LDB as five values.
       (values (append temps (list btemp))       ;Temporary variables.
-              (append temps (list bit))          ;Value forms.
+              (append vals (list bit))          ;Value forms.
               (list store)             ;Store variables.
               `(let ((,stemp (set-char-bit ,access-form ,btemp ,store)))
                  ,store-form
@@ -92,6 +73,8 @@
            (eql (length (string object)) 1))))
 
 (deftype character-designator ()
+  ;; Can't be a real type because of the requirement that
+  ;; symbol names be of length 1. There's no way to express that.
   `(satisfies character-designator-p))
 
 (defun character (character-designator)
@@ -444,6 +427,8 @@ If it is, then its weight is returned as an integer; otherwise, nil is returned.
     (#x104027 "Right-Super")
     (#x104028 "Left-Hyper")
     (#x104029 "Right-Hyper")
+    (#x10402A "Scroll-Lock" "Scrolllock")
+    (#x10402B "Num-Lock" "Numlock")
     (#x1040F0 "KP-0")
     (#x1040F1 "KP-1")
     (#x1040F2 "KP-2")
@@ -514,6 +499,7 @@ If it is, then its weight is returned as an integer; otherwise, nil is returned.
 
 (defun name-char (name)
   "Returns the character whose name is NAME or NIL if no such character exists."
+  (check-type name string-designator)
   (let ((start 0)
         (control nil) (meta nil) (super nil) (hyper nil))
     ;; TODO: Allow prefixes in any order.

@@ -1,9 +1,6 @@
-;;;; Copyright (c) 2011-2016 Henry Harrington <henry.harrington@gmail.com>
-;;;; This code is licensed under the MIT license.
-
 ;;;; Lower anything that modifies the special stack to explicit compiler builtins.
 
-(in-package :sys.c)
+(in-package :mezzano.compiler)
 
 (defvar *special-bindings*)
 (defvar *verify-special-stack* nil)
@@ -35,9 +32,6 @@
     (assert (or (null (lambda-information-rest-arg lambda))
                 (lexical-variable-p (lambda-information-rest-arg lambda)))
             (lambda) "Special rest argument did not get lowered!")
-    (assert (or (null (lambda-information-fref-arg lambda))
-                (lexical-variable-p (lambda-information-fref-arg lambda)))
-            (lambda) "Special fref argument did not get lowered!")
     (assert (or (null (lambda-information-closure-arg lambda))
                 (lexical-variable-p (lambda-information-closure-arg lambda)))
             (lambda) "Special closure argument did not get lowered!")
@@ -114,7 +108,7 @@
        form))
 
 (defmethod lsb-form ((form ast-let))
-  (let ((*special-bindings* *special-bindings*))
+  (let ((updated-special-bindings *special-bindings*))
     (labels ((frob (bindings)
                (cond (bindings
                       (let* ((binding (first bindings))
@@ -127,15 +121,17 @@
                                 form))
                           (special-variable
                            (push (list :special (first binding))
-                                 *special-bindings*)
+                                 updated-special-bindings)
                            (ast `(progn
                                    (call sys.int::%%bind
-                                         (quote ,(name variable))
+                                         (quote ,(mezzano.runtime::symbol-global-value-cell (name variable)))
                                          ,(lsb-form init-form))
                                    (multiple-value-prog1 ,(frob (rest bindings))
                                      (call sys.int::%%unbind)))
                                 form)))))
-                     (t (lsb-form (body form))))))
+                     (t
+                      (let ((*special-bindings* updated-special-bindings))
+                        (lsb-form (body form)))))))
       (frob (bindings form)))))
 
 (defmethod lsb-form ((form ast-multiple-value-bind))
@@ -182,12 +178,18 @@
           (t
            ;; Local RETURN-FROM, locate the matching BLOCK and emit any unwind forms required.
            ;; Note: Unwinding one-past the location so as to pop the block as well.
-           (ast `(return-from ,tag
-                   (multiple-value-prog1
-                       ,(lsb-form value-form)
-                     (progn ,@(lsb-unwind-to (cdr (lsb-find-b-or-t-binding tag)))))
-                   ,location)
-                form)))))
+           ;; Avoid generating M-V-P1 if there's nothing to unwind.
+           (let ((converted-value-form (lsb-form value-form))
+                 (unwind-forms (lsb-unwind-to (cdr (lsb-find-b-or-t-binding tag)))))
+             (if unwind-forms
+                 (ast `(return-from ,tag
+                         (multiple-value-prog1
+                             ,converted-value-form
+                           (progn ,@unwind-forms))
+                         ,location)
+                      form)
+                 (ast `(return-from ,tag ,converted-value-form ,location)
+                      form)))))))
 
 (defmethod lsb-form ((form ast-setq))
   (ast `(setq ,(setq-variable form) ,(lsb-form (value form)))
@@ -235,7 +237,8 @@
     (assert (or (lambda-information-p cleanup-function)
                 (and (typep cleanup-function 'ast-call)
                      (eql (name cleanup-function) 'sys.int::make-closure)
-                     (= (list-length (arguments cleanup-function)) 2)
+                     (or (= (list-length (arguments cleanup-function)) 2)
+                         (= (list-length (arguments cleanup-function)) 3))
                      (lambda-information-p (first (arguments cleanup-function))))))
     (when (not (lambda-information-p cleanup-function))
       ;; cleanup closures use the unwind-protect call protocol (code in r13, env in rbx, no closure indirection).

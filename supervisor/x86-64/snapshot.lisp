@@ -1,6 +1,3 @@
-;;;; Copyright (c) 2011-2016 Henry Harrington <henry.harrington@gmail.com>
-;;;; This code is licensed under the MIT license.
-
 (in-package :mezzano.supervisor)
 
 (defun snapshot-mark-cow-dirty-pages ()
@@ -45,10 +42,8 @@
          do (mark-pml4e-cow i))
       ;; Skip wired stack area, entry 64.
       (loop for i from 65 below 256 ; stack area to end of persistent memory.
-         do (mark-pml4e-cow i))
-      ;; Cover the part of the pinned area that got missed as well.
-      (let ((pml3 (convert-to-pmap-address (logand (sys.int::memref-unsigned-byte-64 pml4 0) +x86-64-pte-address-mask+))))
-        ;; Skip first 2 entries, the wired area.
-        (loop for i from 2 below 512
-           do (mark-pml3e-cow pml3 i)))))
-  (flush-tlb))
+         do (mark-pml4e-cow i))))
+  (begin-tlb-shootdown)
+  (flush-tlb)
+  (tlb-shootdown-all)
+  (finish-tlb-shootdown))

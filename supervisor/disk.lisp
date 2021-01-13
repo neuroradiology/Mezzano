@@ -1,5 +1,4 @@
-;;;; Copyright (c) 2015-2016 Henry Harrington <henry.harrington@gmail.com>
-;;;; This code is licensed under the MIT license.
+;;;; Generic interface for disks and other superviser-level block devices
 
 (in-package :mezzano.supervisor)
 
@@ -27,13 +26,16 @@
   max-transfer
   read-fn
   write-fn
-  (valid t))
+  flush-fn
+  (valid t)
+  name)
 
 (defstruct (partition
              (:area :wired))
   disk
   offset
-  id)
+  id
+  type)
 
 (defstruct (disk-request
              (:constructor make-disk-request ())
@@ -46,7 +48,7 @@
   n-sectors
   buffer
   (lock (place-spinlock-initializer))
-  (latch (make-latch "Disk request notifier"))
+  (latch (make-event :name "Disk request notifier"))
   next)
 
 (sys.int::defglobal *disks*)
@@ -61,7 +63,7 @@
   ;; is found, so no allocation outside the wired area.
   *disks*)
 
-(defun register-disk (device writable-p n-sectors sector-size max-transfer read-fn write-fn)
+(defun register-disk (device writable-p n-sectors sector-size max-transfer read-fn write-fn flush-fn name)
   (when (> sector-size +4k-page-size+)
     (debug-print-line "Ignoring device " device " with overly-large sector size " sector-size " (should be <= than 4k).")
     (return-from register-disk))
@@ -71,7 +73,9 @@
                          :n-sectors n-sectors
                          :max-transfer max-transfer
                          :read-fn read-fn
-                         :write-fn write-fn)))
+                         :write-fn write-fn
+                         :flush-fn flush-fn
+                         :name name)))
     (debug-print-line "Registered new " (if writable-p "R/W" "R/O") " disk " disk " sectors:" n-sectors)
     (setf *disks* (sys.int::cons-in-area disk *disks* :wired))))
 
@@ -81,19 +85,19 @@
     (setf *disk-request-current* nil
           *disk-request-queue-head* nil
           *disk-request-queue-lock* (place-spinlock-initializer)
-          *disk-request-queue-latch* (make-latch "Disk request queue notifier")
+          *disk-request-queue-latch* (make-event :name "Disk request queue notifier")
           *disks* '()))
   ;; Abort any queued or in-progress requests.
   (do ((request *disk-request-queue-head* (disk-request-next request)))
       ((null request))
     (setf (disk-request-state request) :error
           (disk-request-error-reason request) :system-reinitialized)
-    (latch-trigger (disk-request-latch request)))
+    (setf (event-state (disk-request-latch request)) t))
   (setf *disk-request-queue-head* nil)
   (when *disk-request-current*
     (setf (disk-request-state *disk-request-current*) :error
           (disk-request-error-reason *disk-request-current*) :system-reinitialized)
-    (latch-trigger (disk-request-latch *disk-request-current*))
+    (setf (event-state (disk-request-latch *disk-request-current*)) t)
     (setf *disk-request-current* nil))
   ;; Clear the disk list.
   (dolist (disk *disks*)
@@ -111,8 +115,8 @@
                      *disk-request-current* req)
                (setf *disk-request-queue-head* (disk-request-next req)))
              (return req)))
-         (latch-reset *disk-request-queue-latch*)))
-     (latch-wait *disk-request-queue-latch*)))
+         (setf (event-state *disk-request-queue-latch*) nil)))
+     (event-wait *disk-request-queue-latch*)))
 
 (defun process-one-disk-request (request)
   (let* ((disk (disk-request-disk request))
@@ -128,64 +132,72 @@
                         " " buffer))
     (when (and (not (disk-writable-p disk))
                (eql direction :write))
-       (return-from process-one-disk-request
-         (values nil "Write to read-only disk.")))
+      (return-from process-one-disk-request
+        (values nil "Write to read-only disk.")))
+    (when (and (not (disk-writable-p disk))
+               (eql direction :flush))
+      ;; Disk is read-only, flush does nothing.
+      (return-from process-one-disk-request t))
     (case direction
       (:read (set-disk-read-light t))
-      (:write (set-disk-write-light t)))
-    (cond
-      ((sys.int::fixnump buffer)
-       (setf real-buffer buffer))
-      ;; Must be a wired simple ub8 vector.
-      ;; Be very careful when checking the type here.
-      ;; Check that it is an object first, then wired,
-      ;; then the exact type.
-      ;; This stops the disk-thread from touching memory that might not be
-      ;; wired.
-      ((and (sys.int::%value-has-tag-p buffer sys.int::+tag-object+)
-            (< (sys.int::lisp-object-address buffer) (* 2 1024 1024 1024))
-            (eql (sys.int::%object-tag buffer) sys.int::+object-tag-array-unsigned-byte-8+))
-       ;; Reading or writing into an array, allocate a bounce buffer.
-       ;; TODO: Do this without the bounce buffer.
-       (setf bounce-buffer (allocate-physical-pages
-                            (ceiling (* (disk-request-n-sectors request)
-                                        (disk-sector-size disk))
-                                     +4k-page-size+)))
-       (when (not bounce-buffer)
-         (return-from process-one-disk-request
-           (values nil "Unable to allocate disk bounce buffer.")))
-       (setf real-buffer (convert-to-pmap-address (* bounce-buffer +4k-page-size+)))
-       (when (eql direction :write)
-         (dotimes (i (sys.int::%object-header-data buffer))
-           (setf (sys.int::memref-unsigned-byte-8 real-buffer i)
-                 (sys.int::%object-ref-unsigned-byte-8 buffer i)))))
-      (t ;; Weird buffer type. Give up.
-       (return-from process-one-disk-request
-         (values nil "Bad disk buffer type."))))
-    ;; Execute.
-    (multiple-value-bind (successp error)
-        (funcall (case direction
-                   (:read (disk-read-fn disk))
-                   (:write (disk-write-fn disk)))
-                 (disk-device disk)
-                 (disk-request-lba request)
-                 ;; FIXME: Deal with n-sectors > disk max-sectors.
-                 (disk-request-n-sectors request)
-                 real-buffer)
-      (when bounce-buffer
-        (when (and successp
-                   (eql direction :read))
-          (dotimes (i (sys.int::%object-header-data buffer))
-            (setf (sys.int::%object-ref-unsigned-byte-8 buffer i)
-                  (sys.int::memref-unsigned-byte-8 real-buffer i))))
-        (release-physical-pages bounce-buffer
-                                (ceiling (* (disk-request-n-sectors request)
-                                            (disk-sector-size disk))
-                                         +4k-page-size+)))
+      ((:write :flush) (set-disk-write-light t)))
+    (unwind-protect
+         (cond ((eql direction :flush)
+                (funcall (disk-flush-fn disk) (disk-device disk)))
+               (t
+                (cond
+                  ((sys.int::fixnump buffer)
+                   (setf real-buffer buffer))
+                  ;; Must be a wired simple ub8 vector.
+                  ;; Be very careful when checking the type here.
+                  ;; Check that it is an object first, then wired,
+                  ;; then the exact type.
+                  ;; This stops the disk-thread from touching memory that might not be
+                  ;; wired.
+                  ((and (sys.int::%value-has-tag-p buffer sys.int::+tag-object+)
+                        (< (sys.int::lisp-object-address buffer) sys.int::*wired-area-bump*)
+                        (eql (sys.int::%object-tag buffer) sys.int::+object-tag-array-unsigned-byte-8+))
+                   ;; Reading or writing into an array, allocate a bounce buffer.
+                   ;; TODO: Do this without the bounce buffer.
+                   (setf bounce-buffer (allocate-physical-pages
+                                        (ceiling (* (disk-request-n-sectors request)
+                                                    (disk-sector-size disk))
+                                                 +4k-page-size+)))
+                   (when (not bounce-buffer)
+                     (return-from process-one-disk-request
+                       (values nil "Unable to allocate disk bounce buffer.")))
+                   (setf real-buffer (convert-to-pmap-address (* bounce-buffer +4k-page-size+)))
+                   (when (eql direction :write)
+                     (dotimes (i (sys.int::%object-header-data buffer))
+                       (setf (sys.int::memref-unsigned-byte-8 real-buffer i)
+                             (sys.int::%object-ref-unsigned-byte-8 buffer i)))))
+                  (t ;; Weird buffer type. Give up.
+                   (return-from process-one-disk-request
+                     (values nil "Bad disk buffer type."))))
+                ;; Execute.
+                (multiple-value-bind (successp error)
+                    (funcall (case direction
+                               (:read (disk-read-fn disk))
+                               (:write (disk-write-fn disk)))
+                             (disk-device disk)
+                             (disk-request-lba request)
+                             ;; FIXME: Deal with n-sectors > disk max-sectors.
+                             (disk-request-n-sectors request)
+                             real-buffer)
+                  (when bounce-buffer
+                    (when (and successp
+                               (eql direction :read))
+                      (dotimes (i (sys.int::%object-header-data buffer))
+                        (setf (sys.int::%object-ref-unsigned-byte-8 buffer i)
+                              (sys.int::memref-unsigned-byte-8 real-buffer i))))
+                    (release-physical-pages bounce-buffer
+                                            (ceiling (* (disk-request-n-sectors request)
+                                                        (disk-sector-size disk))
+                                                     +4k-page-size+)))
+                  (values successp error))))
       (case direction
         (:read (set-disk-read-light nil))
-        (:write (set-disk-write-light nil)))
-      (values successp error))))
+        ((:write :flush) (set-disk-write-light nil))))))
 
 (defun disk-thread ()
   (loop
@@ -201,7 +213,7 @@
                     (setf (disk-request-state request) :error
                           (disk-request-error-reason request) reason)))
              (setf *disk-request-current* nil)
-             (latch-trigger (disk-request-latch request))))))))
+             (setf (event-state (disk-request-latch request)) t)))))))
 
 (defun disk-read (disk lba n-sectors buffer)
   "Synchronously read N-SECTORS sectors of data to BUFFER from DISK at sector offset LBA.
@@ -217,11 +229,20 @@ Returns true on success; false and an error on failure."
     (disk-submit-request request disk :write lba n-sectors buffer)
     (disk-await-request request)))
 
+(defun disk-flush (disk)
+  "Synchronously flush DISK's write cache.
+Returns true on success; false and an error on failure."
+  (let ((request (make-disk-request)))
+    (disk-submit-request request disk :flush 0 0 nil)
+    (disk-await-request request)))
+
 (defun disk-submit-request-1 (request disk direction lba n-sectors buffer)
   "Like DISK-SUBMIT-REQUEST but does not signal if the request is not complete.
 Returns true on success; false on failure."
   ;; Wonder if these should fail async...
-  (check-type direction (member :read :write))
+  (check-type direction (member :read :write :flush))
+  (check-type lba integer)
+  (check-type n-sectors integer)
   (assert (<= 0 lba (+ lba n-sectors) (disk-n-sectors disk)))
   ;; This terrible nonsense is because SAFE-WITHOUT-INTERRUPTS
   ;; can't pass more than 3 arguments to the lambda.
@@ -251,15 +272,15 @@ Returns true on success; false on failure."
     (with-symbol-spinlock (*disk-request-queue-lock*)
       (with-place-spinlock ((disk-request-lock request))
         (setf (disk-request-state request) :waiting)
-        (latch-reset (disk-request-latch request))
+        (setf (event-state (disk-request-latch request)) nil)
         (cond ((disk-valid disk)
                ;; Attach to request list.
                (setf (disk-request-next request) *disk-request-queue-head*
                      *disk-request-queue-head* request)
                ;; Wake the disk thread.
-               (latch-trigger *disk-request-queue-latch*))
+               (setf (event-state *disk-request-queue-latch*) t))
               (t
-               (latch-trigger (disk-request-latch request))
+               (setf (event-state (disk-request-latch request)) t)
                (setf (disk-request-state request) :error
                      (disk-request-error-reason request) :system-reinitialized))))))
   ;; All done.
@@ -293,12 +314,12 @@ An in-progress request may be cancelled, or it may complete."
                        (setf (disk-request-next prev) (disk-request-next request))))))
           (setf (disk-request-state request) :error
                 (disk-request-error-reason request) reason)
-          (latch-trigger (disk-request-latch request)))))))
+          (setf (event-state (disk-request-latch request)) t))))))
 
 (defun disk-await-request (request)
   "Wait for REQUEST to complete. Returns true if the request succeeded; false on failure.
 Second value is the failure reason."
-  (latch-wait (disk-request-latch request))
+  (event-wait (disk-request-latch request))
   (case (disk-request-state request)
     (:complete
      t)

@@ -1,7 +1,4 @@
-;;;; Copyright (c) 2011-2016 Henry Harrington <henry.harrington@gmail.com>
-;;;; This code is licensed under the MIT license.
-
-;;; High-level interrupt management.
+;;;; High-level interrupt management.
 
 (in-package :mezzano.supervisor)
 
@@ -54,7 +51,7 @@ RETURN-FROM/GO must not be used to leave this form."
         (old-value (gensym)))
     (multiple-value-bind (vars vals old-sym new-sym cas-form read-form)
         (sys.int::get-cas-expansion place environment)
-      `(let ((,self (local-cpu-info))
+      `(let ((,self (local-cpu))
              ,@(mapcar #'list vars vals))
          (ensure-interrupts-disabled)
          (block nil
@@ -66,7 +63,7 @@ RETURN-FROM/GO must not be used to leave this form."
                ;; Prev value was :unlocked, have locked the lock.
                (return))
              (when (eq ,old-value ,self)
-               (panic "Spinlock " ',place " held by self!")))
+               (panic "Spinlock " ',place " held by self. " ,self " " (local-cpu))))
            ;; Loop until acquired.
            (loop
               ;; Read (don't CAS) the place until it goes back to :unlocked.
@@ -94,29 +91,51 @@ RETURN-FROM/GO must not be used to leave this form."
           (progn ,@body)
        (release-place-spinlock ,place))))
 
+(defmacro ensure-place-spinlock-held (place)
+  (let ((holder (gensym)))
+    `(let ((,holder ,place))
+       (ensure (eql ,holder (local-cpu)) "Expected lock " ',place " to be held by " (local-cpu-info) " but is held by " ,holder))))
+
+(defmacro acquire-symbol-spinlock (lock)
+  (check-type lock symbol)
+  `(acquire-place-spinlock (sys.int::symbol-global-value ',lock)))
+
+(defmacro release-symbol-spinlock (lock)
+  (check-type lock symbol)
+  `(release-place-spinlock (sys.int::symbol-global-value ',lock)))
+
 (defmacro with-symbol-spinlock ((lock) &body body)
   (check-type lock symbol)
   `(with-place-spinlock ((sys.int::symbol-global-value ',lock))
      ,@body))
 
-(sys.int::defglobal *page-fault-hook* nil)
+(defmacro ensure-symbol-spinlock-held (lock)
+  (check-type lock symbol)
+  `(ensure-place-spinlock-held (sys.int::symbol-global-value ',lock)))
 
 (defmacro with-page-fault-hook (((&optional frame info fault-address) &body hook-body) &body body)
   (let ((old (gensym))
         (frame (or frame (gensym "FRAME")))
         (info (or info (gensym "INFO")))
-        (fault-address (or fault-address (gensym "FAULT-ADDRESS"))))
-    `(flet ((page-fault-hook-fn (,frame ,info ,fault-address)
-              (declare (ignorable ,frame ,info ,fault-address))
-              ,@hook-body))
-       (declare (dynamic-extent #'page-fault-hook-fn))
-       (ensure-interrupts-disabled)
-       (let ((,old *page-fault-hook*))
-         (unwind-protect
-              (progn
-                (setf *page-fault-hook* #'page-fault-hook-fn)
-                ,@body)
-           (setf *page-fault-hook* ,old))))))
+        (fault-address (or fault-address (gensym "FAULT-ADDRESS")))
+        (ist-state (gensym))
+        (exit-block (gensym "EXIT")))
+    `(block ,exit-block
+       (flet ((page-fault-hook-fn (,frame ,info ,fault-address ,ist-state)
+                (declare (ignorable ,frame ,info ,fault-address ,ist-state))
+                (macrolet ((abandon-page-fault (&optional values)
+                             `(progn
+                                (restore-page-fault-ist ,',ist-state)
+                                (return-from ,',exit-block ,values))))
+                  ,@hook-body)))
+         (declare (dynamic-extent #'page-fault-hook-fn))
+         (ensure-interrupts-disabled)
+         (let ((,old (local-cpu-page-fault-hook)))
+           (unwind-protect
+                (progn
+                  (setf (local-cpu-page-fault-hook) #'page-fault-hook-fn)
+                  ,@body)
+             (setf (local-cpu-page-fault-hook) ,old)))))))
 
 ;;; Introspection.
 
@@ -194,6 +213,86 @@ RETURN-FROM/GO must not be used to leave this form."
                            (interrupt-frame-register-offset register))
         value))
 
+;;; IRQs
+
+(defstruct (irq
+             (:area :wired))
+  platform-number
+  attachments
+  (count 0)
+  (lock (place-spinlock-initializer)))
+
+(defstruct (irq-attachment
+             (:area :wired))
+  irq
+  device
+  handler
+  exclusive-p
+  pending-eoi)
+
+(defun irq-deliver (interrupt-frame irq)
+  (with-place-spinlock ((irq-lock irq))
+    (incf (irq-count irq))
+    (let ((accept-count 0)
+          (pending-count 0))
+      (dolist (attachment (irq-attachments irq))
+        (when (irq-attachment-pending-eoi attachment)
+          (debug-print-line "Received IRQ " irq " masked by " attachment "?"))
+        (let ((status (funcall (irq-attachment-handler attachment) interrupt-frame irq)))
+          (case status
+            (:rejected) ; Attachment was not expecting this interrupt.
+            (:completed ; Attachment accepted the interrupt and has completed work.
+             (incf accept-count))
+            (:accepted ; Attachment accepted the interrupt, but has oustanding work and will issue a separate EOI.
+             (incf accept-count)
+             (incf pending-count)
+             (setf (irq-attachment-pending-eoi attachment) t))
+            (t
+             (panic "Attachment " attachment " handler " (irq-attachment-handler attachment) " on IRQ " irq " returned invalid status " status)))))
+      (when (zerop accept-count)
+        (debug-print-line "No handler accepted IRQ " irq))
+      (when (not (zerop pending-count))
+        ;; Mask the IRQ until all EOIs are delivered.
+        (platform-mask-irq (irq-platform-number irq))))))
+
+(defun irq-attach (irq handler device &key exclusive)
+  (cond (exclusive
+         (when (not (endp (irq-attachments irq)))
+           (debug-print-line "Cannot exclusively attach to IRQ " irq " - in use")
+           (return-from irq-attach nil)))
+        (t
+         (when (and (irq-attachments irq)
+                    (irq-attachment-exclusive-p (first (irq-attachments irq))))
+           (debug-print-line "Cannot attach to IRQ " irq " - in exclusive use")
+           (return-from irq-attach nil))))
+  (let* ((attachment (make-irq-attachment :irq irq
+                                          :device device
+                                          :handler handler
+                                          :exclusive-p exclusive))
+         (cons (sys.int::cons-in-area attachment nil :wired)))
+    (safe-without-interrupts (irq cons)
+      (with-place-spinlock ((irq-lock irq))
+        (setf (cdr cons) (irq-attachments irq)
+              (irq-attachments irq) cons)
+        ;; Unmask the IRQ if this is the first attachment.
+        (when (endp (rest (irq-attachments irq)))
+          (platform-unmask-irq (irq-platform-number irq)))))
+    attachment))
+
+(defun irq-eoi (attachment)
+  (safe-without-interrupts (attachment)
+    (let ((irq (irq-attachment-irq attachment)))
+      (with-place-spinlock ((irq-lock irq))
+        (when (not (irq-attachment-pending-eoi attachment))
+          (debug-print-line "Multiple EOI calls for attachment " attachment))
+        (setf (irq-attachment-pending-eoi attachment) nil)
+        ;; Unmask the IRQ if all attachments have EOI'd.
+        (when (dolist (a (irq-attachments irq) t)
+                (when (irq-attachment-pending-eoi a)
+                  (return nil)))
+          (platform-unmask-irq (irq-platform-number irq))))))
+  (values))
+
 ;;; Simple IRQ handler.
 ;;; When an IRQ is received, the IRQ is masked and a latch is triggered.
 
@@ -202,25 +301,69 @@ RETURN-FROM/GO must not be used to leave this form."
              (:constructor %make-simple-irq))
   irq
   function
-  latch)
+  attachment
+  latch
+  event
+  (state :masked)
+  (lock (place-spinlock-initializer)))
 
-(defun make-simple-irq (irq latch)
-  (declare (sys.c::closure-allocation :wired))
-  (let* ((simple-irq (%make-simple-irq :irq irq
+(defun make-simple-irq (irq-number &optional latch)
+  (declare (mezzano.compiler::closure-allocation :wired))
+  (let* ((irq (platform-irq irq-number))
+         (simple-irq (%make-simple-irq :irq irq
                                        :latch latch))
+         (event (make-event :name simple-irq))
          (fn (lambda (interrupt-frame irq)
-               (declare (ignore interrupt-frame))
-               (latch-trigger (simple-irq-latch simple-irq))
-               (platform-mask-irq irq))))
-    (setf (simple-irq-function simple-irq) fn)
+               (declare (ignore interrupt-frame irq))
+               (with-place-spinlock ((simple-irq-lock simple-irq))
+                 (case (simple-irq-state simple-irq)
+                   ((:masked :masked-eoi-pending)
+                    :rejected)
+                   (:unmasked
+                    (setf (simple-irq-state simple-irq) :masked-eoi-pending)
+                    (when (simple-irq-latch simple-irq)
+                      (setf (event-state (simple-irq-latch simple-irq)) t))
+                    (setf (event-state (simple-irq-event simple-irq)) t)
+                    :accepted))))))
+    (setf (simple-irq-event simple-irq) event
+          (simple-irq-function simple-irq) fn
+          (simple-irq-attachment simple-irq) (irq-attach irq fn simple-irq))
     simple-irq))
 
 (defun simple-irq-attach (simple-irq)
-  (platform-attach-irq (simple-irq-irq simple-irq)
-                       (simple-irq-function simple-irq)))
+  (declare (ignore simple-irq))
+  (values))
 
 (defun simple-irq-mask (simple-irq)
-  (platform-mask-irq (simple-irq-irq simple-irq)))
+  (safe-without-interrupts (simple-irq)
+    (with-place-spinlock ((simple-irq-lock simple-irq))
+      (case (simple-irq-state simple-irq)
+        (:masked-eoi-pending
+         (setf (simple-irq-state simple-irq) :masked)
+         (setf (event-state (simple-irq-event simple-irq)) nil)
+         (irq-eoi (simple-irq-attachment simple-irq)))
+        (:masked)
+        (:unmasked
+         (setf (simple-irq-state simple-irq) :masked)))))
+  (values))
 
 (defun simple-irq-unmask (simple-irq)
-  (platform-unmask-irq (simple-irq-irq simple-irq)))
+  (safe-without-interrupts (simple-irq)
+    (with-place-spinlock ((simple-irq-lock simple-irq))
+      (let ((prev (simple-irq-state simple-irq)))
+        (setf (simple-irq-state simple-irq) :unmasked)
+        (when (eql prev :masked-eoi-pending)
+          (setf (event-state (simple-irq-event simple-irq)) nil)
+          (irq-eoi (simple-irq-attachment simple-irq))))))
+  (values))
+
+(defun simple-irq-pending-p (simple-irq)
+  "Returns true if an IRQ has been delivered and the SIMPLE-IRQ is waiting for an EOI."
+  (event-state (simple-irq-event simple-irq)))
+
+(defun simple-irq-masked-p (simple-irq)
+  "Return if SIMPLE-IRQ has been masked.
+Returns true if it has either been masked manually with SIMPLE-IRQ-MASK or
+automatically through IRQ delivery."
+  ;; Could be :MASKED or :MASKED-EOI-PENDING
+  (not (eql (simple-irq-state simple-irq) :unmasked)))

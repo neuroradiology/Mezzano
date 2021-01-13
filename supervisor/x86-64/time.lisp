@@ -1,6 +1,3 @@
-;;;; Copyright (c) 2011-2016 Henry Harrington <henry.harrington@gmail.com>
-;;;; This code is licensed under the MIT license.
-
 (in-package :mezzano.supervisor)
 
 (defconstant +pit-irq+ 0)
@@ -52,20 +49,43 @@
   (let ((n (calibrate-tsc-1)))
     (dotimes (i 5)
       (setf n (/ (+ n (calibrate-tsc-1)) 2)))
-    (setf *cpu-speed* n)))
+    (setf *cpu-speed* (floor n))))
+
+(defun high-precision-time-units-to-internal-time-units (tsc-time)
+  (if (boundp '*cpu-speed*)
+      ;; Do this to avoid producing intermediate bignum or ratio results.
+      ;; This loses a bit of precision...
+      (truncate tsc-time (truncate *cpu-speed* internal-time-units-per-second))
+      0))
+
+(defun get-high-precision-timer ()
+  "Returns the current value of the platform's 'high precision' timer.
+This timer will generally run at a faster rate the the standard internal-run-time
+timer. However, this timer is non-monotonic. It may wrap at any time and can
+warp backwards and forwards over a snapshot.
+Returns the current value in high-precision time units.
+They can be converted to internal time units using
+HIGH-PRECISION-TIME-UNITS-TO-INTERNAL-TIME-UNITS."
+  ;; This implementation assumes that TSCs are invariant and properly
+  ;; synchronized across cores.
+  (sys.int::tsc))
 
 (defun initialize-platform-time ()
   (when (not (boundp '*rtc-lock*))
     (setf *rtc-lock* (place-spinlock-initializer)))
   (configure-pit-tick-rate 100)
-  (i8259-hook-irq +pit-irq+ 'pit-irq-handler)
-  (i8259-unmask-irq +pit-irq+)
-  (calibrate-tsc))
+  (irq-attach (platform-irq +pit-irq+)
+              'pit-irq-handler
+              'pit
+              :exclusive t)
+  (calibrate-tsc)
+  (lapic-timer-calibrate))
 
 (defun pit-irq-handler (interrupt-frame irq)
   (declare (ignore irq))
   (beat-heartbeat *run-time-advance*)
-  (profile-sample interrupt-frame))
+  (profile-sample interrupt-frame)
+  :completed)
 
 ;; RTC IO ports.
 (defconstant +rtc-index-io-reg+ #x70)
@@ -172,3 +192,9 @@ It should be the current year, or earlier."
         (incf year century)
         (when (< year century-boundary) (incf year 100)))
       (values second minute hour day month year))))
+
+(defun get-universal-time ()
+  (multiple-value-bind (second minute hour day month year)
+      (read-rtc-time)
+    (encode-universal-time second minute hour day month year
+                           (if sys.int::*rtc-is-utc* 0 sys.int::*time-zone*))))

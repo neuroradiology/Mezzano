@@ -1,5 +1,4 @@
-;;;; Copyright (c) 2011-2016 Henry Harrington <henry.harrington@gmail.com>
-;;;; This code is licensed under the MIT license.
+;;;; Supervisor-side of the PS/2 keyboard and mouse drivers.
 
 (in-package :mezzano.supervisor)
 
@@ -38,10 +37,13 @@
 (defconstant +ps/2-config-aux-clock+ (ash 1 5))
 (defconstant +ps/2-config-key-translation+ (ash 1 6))
 
+(defconstant +ps/2-command-resend+ #xFE)
+
 (sys.int::defglobal *ps/2-present*)
 (sys.int::defglobal *ps/2-key-fifo*)
 (sys.int::defglobal *ps/2-aux-fifo*)
 (sys.int::defglobal *ps/2-controller-lock*)
+(sys.int::defglobal *ps/2-mouse-device-id*)
 
 (sys.int::defglobal *ps/2-debug-dump-state*)
 
@@ -58,7 +60,7 @@
                   ;; Stay in this state.
                   )
                  ((eql byte #x57) ; F11
-                  (debug-dump-threads)
+                  (debug-magic-button)
                   (setf *ps/2-debug-dump-state* 0))
                  (t
                   (setf *ps/2-debug-dump-state* 0))))
@@ -67,11 +69,13 @@
 
 (defun ps/2-key-irq-handler (interrupt-frame irq)
   (declare (ignore interrupt-frame irq))
-  (ps/2-irq-handler *ps/2-key-fifo* t))
+  (ps/2-irq-handler *ps/2-key-fifo* t)
+  :completed)
 
 (defun ps/2-aux-irq-handler (interrupt-frame irq)
   (declare (ignore interrupt-frame irq))
-  (ps/2-irq-handler *ps/2-aux-fifo* nil))
+  (ps/2-irq-handler *ps/2-aux-fifo* nil)
+  :completed)
 
 (defun ps/2-input-wait (&optional (what "data"))
   "Wait for space in the input buffer."
@@ -88,6 +92,11 @@
             (debug-print-line "PS/2: Timeout waiting for " what "."))
     (when (not (zerop (logand (sys.int::io-port/8 +ps/2-control-port+) +ps/2-status-output-buffer-status+)))
       (return t))))
+
+(defun ps/2-output-read (&optional (what "data"))
+  (if (ps/2-output-wait what)
+      (sys.int::io-port/8 +ps/2-data-port+)
+      :timeout))
 
 (defun ps/2-port-write (byte command)
   (without-interrupts
@@ -123,6 +132,57 @@
   (irq-fifo-reset *ps/2-key-fifo*)
   (irq-fifo-reset *ps/2-aux-fifo*))
 
+(defun check-ps/2-response (response why)
+  (let ((data (ps/2-output-read why)))
+    (unless (eql response data)
+      (panic "Invalid mouse response. Expected " response " got " data "(" why ")"))))
+
+(defun ps/2-mouse-init ()
+  (setf *ps/2-mouse-device-id* nil)
+  ;; Probe for a mouse.
+  (ps/2-aux-write #xF2) ; Get device ID.
+  (let ((mouse-id-ack (ps/2-output-read "get device id (status)")))
+    (when (not (eql mouse-id-ack #xFA))
+      (debug-print-line "PS/2 mouse init got " mouse-id-ack " during probe (1)")
+      (return-from ps/2-mouse-init)))
+  (let ((device-id-1 (ps/2-output-read "get device id (byte 1)")))
+    ;; Device ID can be up to two bytes long, ignore the second byte.
+    (ps/2-output-read "get device id (byte 2, timeout expected)")
+    (when (not (member device-id-1 '(#x00 #x03 #x04)))
+      (debug-print-line "PS/2 mouse init got unknown device id " device-id-1 " during probe (2)")
+      (return-from ps/2-mouse-init))
+    (debug-print-line "Detected PS/2 mouse with device ID " device-id-1))
+  ;; Enable mouse defaults & reporting.
+  (ps/2-aux-write #xF6)                 ; Set defaults (reset)
+  (check-ps/2-response #xFA "set defaults")
+  ;; Enable Intellimouse mode.
+  ;; TODO: Recheck the device ID after doing this to see if intellimouse mode
+  ;; was really enabled.
+  (ps/2-aux-write #xF3)                 ; Intellimouse magic sequence i.e.,
+  (check-ps/2-response #xFA "intellimouse rate 200 (1)")
+  (ps/2-aux-write #xC8)                 ; support wheel mouse
+  (check-ps/2-response #xFA "intellimouse rate 200 (2)") ; see documentation in
+  (ps/2-aux-write #xF3)                 ; gui/input-drivers.lisp
+  (check-ps/2-response #xFA "intellimouse rate 100 (1)")
+  (ps/2-aux-write #x64)
+  (check-ps/2-response #xFA "intellimouse rate 100 (2)")
+  (ps/2-aux-write #xF3)
+  (check-ps/2-response #xFA "intellimouse rate 80 (1)")
+  (ps/2-aux-write #x50)
+  (check-ps/2-response #xFA "intellimouse rate 80 (2)")
+  ;; Recheck the device ID to see if intellimouse mode was really enabled.
+  (ps/2-aux-write #xF2) ; Get device ID.
+  (check-ps/2-response #xFA "get device id (second, status)")
+  (let ((device-id-1 (ps/2-output-read "get device id (second, byte 1)")))
+    ;; Device ID can be up to two bytes long, ignore the second byte.
+    (ps/2-output-read "get device id (second, byte 2, timeout expected)")
+    (setf *ps/2-mouse-device-id* device-id-1)
+    (debug-print-line "Detected PS/2 mouse with device ID " device-id-1)
+    (when (eql device-id-1 #x03)
+      (debug-print-line "PS/2 intellimouse mode enabled")))
+  (ps/2-aux-write #xF4)                 ; Mouse enable (streaming mode)
+  (check-ps/2-response #xFA "mouse enable"))
+
 (defun probe-ps/2 ()
   (debug-print-line "Probing PS/2")
   (setf *ps/2-present* t)
@@ -140,19 +200,16 @@
     (setf (sys.int::io-port/8 +ps/2-control-port+) +ps/2-write-config-byte+)
     (ps/2-input-wait)
     (setf (sys.int::io-port/8 +ps/2-data-port+) config))
-  ;; Enable mouse defaults & reporting.
-  (ps/2-aux-write #xF6)
-  ;; Read response.
-  (ps/2-output-wait)
-  (sys.int::io-port/8 +ps/2-data-port+)
-  (ps/2-aux-write #xF4)
-  (ps/2-output-wait)
-  (sys.int::io-port/8 +ps/2-data-port+)
+  (ps/2-mouse-init)
   ;; Enable both IRQs.
-  (i8259-hook-irq +ps/2-key-irq+ 'ps/2-key-irq-handler)
-  (i8259-hook-irq +ps/2-aux-irq+ 'ps/2-aux-irq-handler)
-  (i8259-unmask-irq +ps/2-key-irq+)
-  (i8259-unmask-irq +ps/2-aux-irq+)
+  (irq-attach (platform-irq +ps/2-key-irq+)
+              'ps/2-key-irq-handler
+              'ps/2-key
+              :exclusive t)
+  (irq-attach (platform-irq +ps/2-aux-irq+)
+              'ps/2-aux-irq-handler
+              'ps/2-aux
+              :exclusive t)
   ;; Data may have accumulated in the FIFOs.
   (irq-fifo-reset *ps/2-key-fifo*)
   (irq-fifo-reset *ps/2-aux-fifo*))

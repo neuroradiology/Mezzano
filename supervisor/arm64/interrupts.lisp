@@ -1,6 +1,3 @@
-;;;; Copyright (c) 2016 Henry Harrington <henry.harrington@gmail.com>
-;;;; This code is licensed under the MIT license.
-
 (in-package :mezzano.supervisor)
 
 (sys.int::define-lap-function ensure-on-wired-stack ()
@@ -20,10 +17,8 @@
   (mezzano.lap.arm64:ret)
   BAD
   (mezzano.lap.arm64:ldr :x0 (:constant "Not on wired stack."))
-  (mezzano.lap.arm64:ldr :x7 (:function panic))
   (mezzano.lap.arm64:movz :x5 #.(ash 1 sys.int::+n-fixnum-bits+))
-  (mezzano.lap.arm64:ldr :x9 (:object :x7 #.sys.int::+fref-entry-point+))
-  (mezzano.lap.arm64:blr :x9)
+  (mezzano.lap.arm64:named-call panic)
   (mezzano.lap.arm64:hlt 0))
 
 (sys.int::define-lap-function sys.int::%interrupt-state (())
@@ -103,13 +98,13 @@
   (mezzano.lap.arm64:ret))
 
 (sys.int::define-lap-function %read-esr-el1 (())
-  (mezzano.lap.arm64:mrs :x0 :esr-el1)
-  (mezzano.lap.arm64:add :x0 :xzr :x0 :lsl #.sys.int::+n-fixnum-bits+)
+  (mezzano.lap.arm64:mrs :x9 :esr-el1)
+  (mezzano.lap.arm64:add :x0 :xzr :x9 :lsl #.sys.int::+n-fixnum-bits+)
   (mezzano.lap.arm64:ret))
 
 (sys.int::define-lap-function %read-far-el1 (())
-  (mezzano.lap.arm64:mrs :x0 :far-el1)
-  (mezzano.lap.arm64:add :x0 :xzr :x0 :lsl #.sys.int::+n-fixnum-bits+)
+  (mezzano.lap.arm64:mrs :x9 :far-el1)
+  (mezzano.lap.arm64:add :x0 :xzr :x9 :lsl #.sys.int::+n-fixnum-bits+)
   (mezzano.lap.arm64:ret))
 
 (defun unhandled-interrupt (interrupt-frame name)
@@ -134,23 +129,19 @@
         ((logtest #x3C0 (interrupt-frame-raw-register interrupt-frame :rflags))
          ;; IRQs must be enabled when a page fault occurs.
          (unhandled-interrupt interrupt-frame "page-fault-no-irqs"))
-        ((or (<= 0 fault-addr (1- (* 2 1024 1024 1024)))
+        ((or (<= 0 fault-addr (1- (* 512 1024 1024 1024)))
              (<= (ash sys.int::+address-tag-stack+ sys.int::+address-tag-shift+)
                  fault-addr
                  (+ (ash sys.int::+address-tag-stack+ sys.int::+address-tag-shift+)
                     (* 512 1024 1024 1024))))
-         ;; Pages below 2G are wired and should never be unmapped or protected.
+         ;; Pages below 512G are wired and should never be unmapped or protected.
          ;; Same for pages in the wired stack area.
          (unhandled-interrupt interrupt-frame "wired-page-fault"))
-        ((eql reason :write-to-ro)
-         ;; Copy on write page, might not return.
-         (snapshot-clone-cow-page-via-page-fault interrupt-frame fault-addr))
-        ((eql reason :not-present)
-         ;; Non-present page. Try to load it from the store.
+        (t ;; Defer to the pager.
          ;; Might not return.
-         (wait-for-page-via-interrupt interrupt-frame fault-addr))
-        (t
-         (unhandled-interrupt interrupt-frame "page-fault"))))
+         (wait-for-page-via-interrupt interrupt-frame
+                                      fault-addr
+                                      (eql reason :write-to-ro)))))
 
 (defun %instruction-abort-handler (interrupt-frame fault-addr esr)
   (let ((status (ldb (byte 5 0) esr)))
@@ -227,12 +218,3 @@
 
 (defun %serror-elx-handler (interrupt-frame)
   (unhandled-interrupt interrupt-frame "serror-elx"))
-
-(defun platform-mask-irq (vector)
-  (gic-mask-interrupt vector))
-
-(defun platform-unmask-irq (vector)
-  (gic-unmask-interrupt vector))
-
-(defun platform-attach-irq (vector handler)
-  (gic-hook-interrupt vector handler))

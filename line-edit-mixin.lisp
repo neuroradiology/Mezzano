@@ -1,8 +1,9 @@
-;;;; Copyright (c) 2011-2016 Henry Harrington <henry.harrington@gmail.com>
-;;;; This code is licensed under the MIT license.
+;;;; Generic line editor for streams
 
 (defpackage :mezzano.line-editor
   (:use :cl)
+  (:local-nicknames (:gray :mezzano.gray)
+                    (:sys.int :mezzano.internals))
   (:export #:line-edit-mixin
            #:*line-editor-command-table*
 	   #:global-set-key
@@ -36,7 +37,7 @@
   ((%lock :initform (mezzano.supervisor:make-mutex "History table lock") :reader lock)
    (%history-data)))
 
-(defmethod initialize-instance :after ((instance history-table) &key &allow-other-keys)
+(defmethod initialize-instance :after ((instance history-table) &key)
   (history-reset instance))
 
 (defmethod history-reset ((history history-table))
@@ -101,7 +102,7 @@
                      :last-command nil
                      :current-completion nil))
 
-(defvar *line-editor-command-table* (make-hash-table))
+(defvar *line-editor-command-table* (make-hash-table :synchronized t))
 
 (defun global-set-key (keys command)
   "Create keyboard shortcut to any command."
@@ -278,6 +279,7 @@
 
 (define-command break-into-debugger (stream #\C-C)
   "Enter the debugger using BREAK."
+  (declare (ignore stream))
   (break))
 
 (define-command abort-input (stream #\C-G)
@@ -329,7 +331,7 @@
     (setf (current-completion-end stream) new-end)
     (setf (cursor-position stream) (current-completion-end stream))))
 
-(defmethod sys.gray:stream-unread-char ((stream line-edit-mixin) character)
+(defmethod gray:stream-unread-char ((stream line-edit-mixin) character)
   (declare (ignore character))
   (decf (output-progress stream)))
 
@@ -347,7 +349,7 @@
       (setf (line-end-position stream) (multiple-value-list (sys.int::stream-cursor-pos stream)))
       (sys.int::stream-move-to stream cx cy))))
 
-(defmethod sys.gray:stream-read-char :around ((stream line-edit-mixin))
+(defmethod gray:stream-read-char :around ((stream line-edit-mixin))
   (cond ((and (output-progress stream)
               (not (eql (output-progress stream) (length (buffer stream)))))
          (prog1
@@ -376,7 +378,7 @@
                        (write-char #\Newline stream)
                        (setf (output-progress stream) 0)
                        (setf (last-command stream) #\Newline)
-                       (return (sys.gray:stream-read-char stream)))
+                       (return (gray:stream-read-char stream)))
                       (fn
                        (funcall fn stream)
                        (setf (last-command stream) fn)
@@ -404,6 +406,6 @@
                        (redraw-line stream)
                        (setf (last-command stream) ch))))))))
 
-(defmethod sys.gray:stream-clear-input :around ((stream line-edit-mixin))
+(defmethod gray:stream-clear-input :around ((stream line-edit-mixin))
   (when (output-progress stream)
     (setf (output-progress stream) (length (buffer stream)))))

@@ -1,7 +1,6 @@
-;;;; Copyright (c) 2015-2016 Henry Harrington <henry.harrington@gmail.com>
-;;;; This code is licensed under the MIT license.
+;;;; DSL for creating AST objects.
 
-(in-package :sys.c)
+(in-package :mezzano.compiler)
 
 (defun ast (form &optional (inherit *current-lambda*))
   "Produce AST nodes from a programmer-friendly representation.
@@ -33,6 +32,9 @@ Inherit source locations/etc from INHERIT."
            ((the) #'convert-ast-the)
            ((unwind-protect) #'convert-ast-unwind-protect)
            ((call) #'convert-ast-call)
+           ((call-optimize) #'convert-ast-call-optimize)
+           ((source-fragment) #'convert-ast-source-fragment)
+           ((notinline-call) #'convert-ast-notinline-call)
            ((jump-table) #'convert-ast-jump-table))
          inherit
          new-variables
@@ -189,10 +191,13 @@ Inherit source locations/etc from INHERIT."
                                                 (convert-ast-form statement inherit new-variables))))))
 
 (defun convert-ast-the (inherit new-variables type value)
-  (make-instance 'ast-the
-                 :inherit inherit
-                 :type (sys.int::typeexpand type)
-                 :value (convert-ast-form value inherit new-variables)))
+  (cond ((eql type 't)
+         (convert-ast-form value inherit new-variables))
+        (t
+         (make-instance 'ast-the
+                        :inherit inherit
+                        :type (sys.int::typeexpand type)
+                        :value (convert-ast-form value inherit new-variables)))))
 
 (defun convert-ast-unwind-protect (inherit new-variables protected-form cleanup-function)
   (make-instance 'ast-unwind-protect
@@ -207,6 +212,34 @@ Inherit source locations/etc from INHERIT."
                  :arguments (loop
                                for form in arguments
                                collect (convert-ast-form form inherit new-variables))))
+
+(defun convert-ast-call-optimize (inherit new-variables name optimize-settings &rest arguments)
+  (make-instance 'ast-call
+                 :inherit inherit
+                 :name name
+                 :optimize optimize-settings
+                 :arguments (loop
+                               for form in arguments
+                               collect (convert-ast-form form inherit new-variables))))
+
+(defun convert-ast-source-fragment (inherit new-variables form)
+  (declare (ignore inherit))
+  (pass1-form form
+              (extend-environment nil
+                                  :variables (mapcar (lambda (x)
+                                                       (list (car x) (cdr x)))
+                                                     new-variables))))
+
+(defun convert-ast-notinline-call (inherit new-variables name &rest arguments)
+  (let ((ast (make-instance 'ast-call
+                             :inherit inherit
+                             :name name)))
+    (push (list name 'notinline) (ast-inline-declarations ast))
+    (setf (ast-arguments ast)
+          (loop
+             for form in arguments
+             collect (convert-ast-form form ast new-variables)))
+    ast))
 
 (defun convert-ast-jump-table (inherit new-variables value &rest targets)
   (make-instance 'ast-jump-table

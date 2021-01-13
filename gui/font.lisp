@@ -1,28 +1,4 @@
-;;;; Copyright (c) 2011-2016 Henry Harrington <henry.harrington@gmail.com>
-;;;; This code is licensed under the MIT license.
-
-(defpackage :mezzano.gui.font
-  (:use :cl)
-  (:export #:open-font
-           #:name
-           #:size
-           #:line-height
-           #:em-square-width
-           #:ascender
-           #:glyph-character
-           #:glyph-mask
-           #:glyph-yoff
-           #:glyph-xoff
-           #:glyph-advance
-           #:character-to-glyph
-           #:*default-font*
-           #:*default-font-size*
-           #:*default-bold-font*
-           #:*default-bold-font-size*
-           #:*default-monospace-font*
-           #:*default-monospace-font-size*
-           #:*default-monospace-bold-font*
-           #:*default-monospace-bold-font-size*))
+;;;; Font support
 
 (in-package :mezzano.gui.font)
 
@@ -35,28 +11,29 @@
 (defvar *default-monospace-bold-font* "DejaVuSansMono-Bold")
 (defvar *default-monospace-bold-font-size* 12)
 
-(defclass memory-file-stream (sys.gray:fundamental-binary-input-stream file-stream)
+(defclass memory-file-stream (mezzano.gray:fundamental-binary-input-stream file-stream)
   ((%vector :initarg :vector :reader memory-file-stream-vector)
    (%fpos :initform 0)))
 
-(defmethod initialize-instance :after ((stream memory-file-stream) &key vector &allow-other-keys)
+(defmethod initialize-instance :after ((stream memory-file-stream) &key vector)
   (check-type vector (array (unsigned-byte 8))))
 
-(defmethod sys.gray:stream-element-type ((stream memory-file-stream))
+(defmethod mezzano.gray:stream-element-type ((stream memory-file-stream))
   '(unsigned-byte 8))
 
-(defmethod sys.gray:stream-file-position ((stream memory-file-stream) &optional (position-spec nil position-specp))
+(defmethod mezzano.gray:stream-file-position ((stream memory-file-stream) &optional (position-spec nil position-specp))
   (with-slots (%fpos) stream
     (cond (position-specp
-           (setf %fpos (if (eql position-spec :end)
-                           (length (memory-file-stream-vector stream))
-                           position-spec)))
+           (setf %fpos (case position-spec
+                         (:start 0)
+                         (:end (length (memory-file-stream-vector stream)))
+                         (t position-spec))))
           (t %fpos))))
 
-(defmethod sys.gray:stream-file-length ((stream memory-file-stream))
+(defmethod mezzano.gray:stream-file-length ((stream memory-file-stream))
   (length (memory-file-stream-vector stream)))
 
-(defmethod sys.gray:stream-read-byte ((stream memory-file-stream))
+(defmethod mezzano.gray:stream-read-byte ((stream memory-file-stream))
   (with-slots (%fpos) stream
     (cond ((>= %fpos (length (memory-file-stream-vector stream)))
            :eof)
@@ -69,7 +46,7 @@
    (%name :initarg :name :reader name)
    (%lock :reader typeface-lock)))
 
-(defmethod initialize-instance :after ((instance typeface) &key &allow-other-keys)
+(defmethod initialize-instance :after ((instance typeface) &key)
   (setf (slot-value instance '%lock) (mezzano.supervisor:make-mutex (format nil "Typeface ~A lock" (name instance)))))
 
 (defclass font ()
@@ -111,11 +88,10 @@
 (defvar *font-lock* (mezzano.supervisor:make-mutex "Font lock")
   "Lock protecting the typeface and font caches.")
 
-;; TODO: Replace these when weak hash-tables are implemented.
-;; font-name (lowercase) -> [weak-pointer typeface]
-(defvar *typeface-cache* (make-hash-table :test 'equal))
-;; (lowercase font name . single-float size) -> [weak-pointer font]
-(defvar *font-cache* (make-hash-table :test 'equal))
+;; font-name (lowercase) -> typeface
+(defvar *typeface-cache* (make-hash-table :test 'equal :weakness :value))
+;; (lowercase font name . single-float size) -> font
+(defvar *font-cache* (make-hash-table :test 'equal :weakness :value))
 
 (defun path-map-line (path function)
   "Iterate over all the line on the contour of the path."
@@ -129,12 +105,12 @@
      finally (when knot
                (funcall function knot (nth-value 1 (paths:path-iterator-next iterator))))))
 
-(defun rasterize-paths (paths sweep-function &optional (scale 1.0))
+(defun rasterize-paths (paths sweep-function)
   (let ((state (aa:make-state)))
     (flet ((do-line (p1 p2)
              (aa:line-f state
-                        (* scale (paths:point-x p1)) (* scale (paths:point-y p1))
-                        (* scale (paths:point-x p2)) (* scale (paths:point-y p2)))))
+                        (paths:point-x p1) (paths:point-y p1)
+                        (paths:point-x p2) (paths:point-y p2))))
       (loop for path in paths
          do (path-map-line path #'do-line)))
     (aa:cells-sweep state sweep-function)))
@@ -202,7 +178,7 @@
                            (aref cell-cache cell) glyph)))))))
       glyph)))
 
-(defmethod initialize-instance :after ((font font) &key typeface size &allow-other-keys)
+(defmethod initialize-instance :after ((font font) &key typeface size)
   (let ((loader (font-loader typeface)))
     (setf (slot-value font '%font-scale) (/ size (float (zpb-ttf:units/em loader)))
           (slot-value font '%line-height) (round (* (+ (zpb-ttf:ascender loader)
@@ -234,18 +210,16 @@
   (let* ((typeface-key (string-downcase name))
          (font-key (cons typeface-key (float size))))
     (mezzano.supervisor:with-mutex (*font-lock*)
-      (let* ((font-pointer (gethash font-key *font-cache* (sys.int::make-weak-pointer nil)))
-             (font (sys.int::weak-pointer-value font-pointer)))
+      (let ((font (gethash font-key *font-cache*)))
         (when font
           (return-from open-font font))
         ;; No font object, create a new one.
-        (let* ((typeface-pointer (gethash typeface-key *typeface-cache* (sys.int::make-weak-pointer nil)))
-               (typeface (sys.int::weak-pointer-value typeface-pointer)))
+        (let ((typeface (gethash typeface-key *typeface-cache*)))
           (when typeface
             (setf font (make-instance 'font
                                       :typeface typeface
                                       :size (float size))
-                  (gethash font-key *font-cache*) (sys.int::make-weak-pointer font))
+                  (gethash font-key *font-cache*) font)
             #+(or)(format t "Creating new font ~S with typeface ~S.~%" font typeface)
             (return-from open-font font)))))
     ;; Neither font nor typeface in cache. Open the TTF outside the lock
@@ -254,24 +228,95 @@
       (mezzano.supervisor:with-mutex (*font-lock*)
         ;; Repeat font test, another thread may have created the font while
         ;; the lock was dropped.
-        (let* ((font-pointer (gethash font-key *font-cache* (sys.int::make-weak-pointer nil)))
-               (font (sys.int::weak-pointer-value font-pointer)))
+        (let ((font (gethash font-key *font-cache*)))
           (when font
             (return-from open-font font)))
-        (let* ((typeface-pointer (gethash typeface-key *typeface-cache* (sys.int::make-weak-pointer nil)))
-               (typeface (sys.int::weak-pointer-value typeface-pointer)))
+        (let ((typeface (gethash typeface-key *typeface-cache*)))
           (cond (typeface
                  ;; A typeface was created for this font while the lock
                  ;; was dropped. Forget our font loader and use this one.
                  (zpb-ttf:close-font-loader loader))
-                (t (setf typeface (make-instance 'typeface :name (format nil "~:(~A~)" name) :font-loader loader)
-                         (gethash typeface-key *typeface-cache*) (sys.int::make-weak-pointer typeface typeface
-                                                                                             (lambda ()
-                                                                                               (zpb-ttf:close-font-loader loader))))
-                   #+(or)(format t "Creating new typeface ~S.~%" typeface)))
+                (t
+                 (setf typeface (make-instance 'typeface :name (format nil "~:(~A~)" name) :font-loader loader))
+                 (setf (gethash typeface-key *typeface-cache*) typeface)
+                 (sys.int::make-weak-pointer
+                  typeface
+                  :finalizer (lambda ()
+                               (zpb-ttf:close-font-loader loader)))
+                 #+(or)(format t "Creating new typeface ~S.~%" typeface)))
           (let ((font (make-instance 'font
                                      :typeface typeface
                                      :size (float size))))
             #+(or)(format t "Creating new font ~S with typeface ~S.~%" font typeface)
-            (setf (gethash font-key *font-cache*) (sys.int::make-weak-pointer font))
+            (setf (gethash font-key *font-cache*) font)
             font))))))
+
+(defun string-display-width (string font)
+  (loop
+     for ch across string
+     for glyph = (mezzano.gui.font:character-to-glyph font ch)
+     summing (mezzano.gui.font:glyph-advance glyph)))
+
+(defun draw-string (string font surface x y colour)
+  (loop
+     with pen = x
+     for ch across string
+     for glyph = (mezzano.gui.font:character-to-glyph font ch)
+     for mask = (mezzano.gui.font:glyph-mask glyph)
+     do
+       (mezzano.gui:bitset :blend
+                           (mezzano.gui:surface-width mask) (mezzano.gui:surface-height mask)
+                           colour
+                           surface
+                           (+ pen (mezzano.gui.font:glyph-xoff glyph))
+                           (- y (mezzano.gui.font:glyph-yoff glyph))
+                           mask 0 0)
+       (incf pen (mezzano.gui.font:glyph-advance glyph))
+     finally (return pen)))
+
+(defun character-to-raw-glyph (font ch)
+  (let ((code (char-code ch)))
+    (mezzano.supervisor:with-mutex ((glyph-cache-lock font))
+      (mezzano.supervisor:with-mutex ((typeface-lock (typeface font)))
+        (when (and (zpb-ttf:glyph-exists-p code (font-loader font))
+                   (not (zerop (zpb-ttf:code-point (zpb-ttf:find-glyph code (font-loader font))))))
+          (let* ((glyph (zpb-ttf:find-glyph code (font-loader font)))
+                 (scale (font-scale font))
+                 (bb (scale-bb (zpb-ttf:bounding-box glyph) scale))
+                 (advance (round (* (zpb-ttf:advance-width glyph) scale))))
+            (values (paths-ttf:paths-from-glyph glyph
+                                                :scale-x scale
+                                                :scale-y (- scale)
+                                                :offset (paths:make-point 0 (zpb-ttf:ymax bb))
+                                                :auto-orient :cw)
+                    advance
+                    (zpb-ttf:ymax bb)
+                    (zpb-ttf:xmin bb))))))))
+
+(defun draw-stroked-string (string font surface x y colour stroke-colour stroke-width)
+  (loop
+     with pen = x
+     for ch across string
+     do
+       (multiple-value-bind (paths advance yoff xoff)
+           (character-to-raw-glyph font ch)
+         (when advance
+           (rasterize-paths paths
+                            (lambda (px py alpha)
+                              (setf (mezzano.gui:surface-pixel surface (+ pen px) (+ (- y yoff) py))
+                                    (mezzano.gui:make-colour
+                                     (mezzano.gui:colour-red colour)
+                                     (mezzano.gui:colour-green colour)
+                                     (mezzano.gui:colour-blue colour)
+                                     (/ (normalize-alpha alpha) 255.0)))))
+           (rasterize-paths (paths:stroke-path paths stroke-width :assume-type :closed-polyline)
+                            (lambda (px py alpha)
+                              (setf (mezzano.gui:surface-pixel surface (+ pen px) (+ (- y yoff) py))
+                                    (mezzano.gui:colour-over
+                                     (mezzano.gui:surface-pixel surface (+ pen px) (+ (- y yoff) py))
+                                     (mezzano.gui:make-colour
+                                      (mezzano.gui:colour-red stroke-colour)
+                                      (mezzano.gui:colour-green stroke-colour)
+                                      (mezzano.gui:colour-blue stroke-colour)
+                                      (/ (normalize-alpha alpha) 255.0))))))
+           (incf pen advance)))))

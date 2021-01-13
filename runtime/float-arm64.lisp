@@ -1,5 +1,4 @@
-;;;; Copyright (c) 2016 Henry Harrington <henry.harrington@gmail.com>
-;;;; This code is licensed under the MIT license.
+;;;; ARM64 float support functions
 
 (in-package :mezzano.runtime)
 
@@ -11,7 +10,10 @@
 
 (sys.int::define-lap-function sys.int::%integer-as-single-float ((integer))
   (mezzano.lap.arm64:add :x0 :xzr :x0 :lsl #.(- 32 sys.int::+n-fixnum-bits+))
-  (mezzano.lap.arm64:add :x0 :x0 #.sys.int::+tag-single-float+)
+  (mezzano.lap.arm64:add :x0 :x0 #.(logior sys.int::+tag-immediate+
+                                           (dpb sys.int::+immediate-tag-single-float+
+                                                sys.int::+immediate-tag+
+                                                0)))
   (mezzano.lap.arm64:movz :x5 #.(ash 1 sys.int::+n-fixnum-bits+))
   (mezzano.lap.arm64:ret))
 
@@ -28,7 +30,10 @@
                 ;; Box result & return.
                 (mezzano.lap.arm64:fmov :w9 :s0)
                 (mezzano.lap.arm64:add :x9 :xzr :x9 :lsl 32)
-                (mezzano.lap.arm64:add :x0 :x9 #.sys.int::+tag-single-float+)
+                (mezzano.lap.arm64:add :x0 :x9 #.(logior sys.int::+tag-immediate+
+                                                         (dpb sys.int::+immediate-tag-single-float+
+                                                              sys.int::+immediate-tag+
+                                                              0)))
                 (mezzano.lap.arm64:movz :x5 #.(ash 1 sys.int::+n-fixnum-bits+))
                 (mezzano.lap.arm64:ret))))
   (def sys.int::%%single-float-+ mezzano.lap.arm64:fadd)
@@ -86,7 +91,10 @@
   ;; Box result & return.
   (mezzano.lap.arm64:fmov :w9 :s0)
   (mezzano.lap.arm64:add :x9 :xzr :x9 :lsl 32)
-  (mezzano.lap.arm64:add :x0 :x9 #.sys.int::+tag-single-float+)
+  (mezzano.lap.arm64:add :x0 :x9 #.(logior sys.int::+tag-immediate+
+                                           (dpb sys.int::+immediate-tag-single-float+
+                                                sys.int::+immediate-tag+
+                                                0)))
   (mezzano.lap.arm64:movz :x5 #.(ash 1 sys.int::+n-fixnum-bits+))
   (mezzano.lap.arm64:ret))
 
@@ -107,9 +115,7 @@
   ;; Area
   (mezzano.lap.arm64:orr :x3 :xzr :x26)
   ;; Allocate object.
-  (mezzano.lap.arm64:ldr :x7 (:function %allocate-object))
-  (mezzano.lap.arm64:ldr :x9 (:object :x7 #.sys.int::+fref-entry-point+))
-  (mezzano.lap.arm64:blr :x9)
+  (mezzano.lap.arm64:named-call %allocate-object)
   ;; Set data.
   (mezzano.lap.arm64:ldp :x10 :x11 (:post :sp 16))
   (mezzano.lap.arm64:str :x10 (:object :x0 0))
@@ -124,9 +130,7 @@
   (mezzano.lap.arm64:add :x9 :xzr :x0 :asr #.sys.int::+n-fixnum-bits+)
   (mezzano.lap.arm64:scvtf :d0 :x9)
   (mezzano.lap.arm64:fmov :x10 :d0)
-  (mezzano.lap.arm64:ldr :x7 (:function sys.int::%%make-double-float-x10))
-  (mezzano.lap.arm64:ldr :x9 (:object :x7 #.sys.int::+fref-entry-point+))
-  (mezzano.lap.arm64:br :x9))
+  (mezzano.lap.arm64:named-tail-call sys.int::%%make-double-float-x10))
 
 (macrolet ((def (name op)
              `(sys.int::define-lap-function ,name ((x y))
@@ -140,9 +144,7 @@
                 (,op :d0 :d0 :d1)
                 ;; Box result & return.
                 (mezzano.lap.arm64:fmov :x10 :d0)
-                (mezzano.lap.arm64:ldr :x7 (:function sys.int::%%make-double-float-x10))
-                (mezzano.lap.arm64:ldr :x9 (:object :x7 #.sys.int::+fref-entry-point+))
-                (mezzano.lap.arm64:br :x9))))
+                (mezzano.lap.arm64:named-tail-call sys.int::%%make-double-float-x10))))
   (def sys.int::%%double-float-+ mezzano.lap.arm64:fadd)
   (def sys.int::%%double-float-- mezzano.lap.arm64:fsub)
   (def sys.int::%%double-float-* mezzano.lap.arm64:fmul)
@@ -195,9 +197,7 @@
   (mezzano.lap.arm64:fsqrt :d0 :d0)
   ;; Box result & return.
   (mezzano.lap.arm64:fmov :x10 :d0)
-  (mezzano.lap.arm64:ldr :x7 (:function sys.int::%%make-double-float-x10))
-  (mezzano.lap.arm64:ldr :x9 (:object :x7 #.sys.int::+fref-entry-point+))
-  (mezzano.lap.arm64:br :x9))
+  (mezzano.lap.arm64:named-tail-call sys.int::%%make-double-float-x10))
 
 (sys.int::define-lap-function %%coerce-double-float-to-single-float ()
   (mezzano.lap.arm64:ldr :x9 (:object :x0 0))
@@ -206,7 +206,10 @@
   ;; Box result & return.
   (mezzano.lap.arm64:fmov :w9 :s0)
   (mezzano.lap.arm64:add :x9 :xzr :x9 :lsl 32)
-  (mezzano.lap.arm64:add :x0 :x9 #.sys.int::+tag-single-float+)
+  (mezzano.lap.arm64:add :x0 :x9 #.(logior sys.int::+tag-immediate+
+                                           (dpb sys.int::+immediate-tag-single-float+
+                                                sys.int::+immediate-tag+
+                                                0)))
   (mezzano.lap.arm64:movz :x5 #.(ash 1 sys.int::+n-fixnum-bits+))
   (mezzano.lap.arm64:ret))
 
@@ -216,6 +219,4 @@
   (mezzano.lap.arm64:fcvt :d0 :s0)
   ;; Box result & return.
   (mezzano.lap.arm64:fmov :x10 :d0)
-  (mezzano.lap.arm64:ldr :x7 (:function sys.int::%%make-double-float-x10))
-  (mezzano.lap.arm64:ldr :x9 (:object :x7 #.sys.int::+fref-entry-point+))
-  (mezzano.lap.arm64:br :x9))
+  (mezzano.lap.arm64:named-tail-call sys.int::%%make-double-float-x10))

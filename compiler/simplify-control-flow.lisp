@@ -1,13 +1,11 @@
-;;;; Copyright (c) 2015-2016 Henry Harrington <henry.harrington@gmail.com>
-;;;; This code is licensed under the MIT license.
-
 ;;;; Simplify complicated control flow in TAGBODY forms.
 
-(in-package sys.c)
+(in-package :mezzano.compiler)
 
 (defvar *tagbody-statement-stack* '())
 
-(defun simplify-control-flow (form)
+(defun simplify-control-flow (form architecture)
+  (declare (ignore architecture))
   (simplify-control-flow-1 form '() '() '() nil))
 
 (defun simplify-control-flow-get-replacement-go-tag (go-tag renames)

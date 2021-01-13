@@ -55,10 +55,6 @@
 
 ;The companion file "XPDOC.TXT" contains brief documentation.
 
-;must do the following in common lisps not supporting *print-shared*
-
-(defvar *print-shared* nil)
-
 (defvar *print-pprint-dispatch* t ;see initialization at end of file.
   "controls pretty printing of output")
 (defvar *print-right-margin* nil
@@ -85,42 +81,31 @@
 
 (defun structure-type-p (x)
   (and (symbolp x)
-       (get x 'sys.int::structure-type)))
+       (typep (find-class x nil) 'structure-class)))
 (defun output-width (&optional (s *standard-output*))
-  (sys.gray:stream-line-length s))
+  (mezzano.gray:stream-line-length s))
 (defun output-position (&optional (s *standard-output*))
-  (sys.gray:stream-line-column s))
-
-(defvar *locating-circularities* nil
-  "Integer if making a first pass over things to identify circularities.
-   Integer used as counter for #n= syntax.")
-(defvar *parents* nil "used when *print-shared* is nil")
+  (mezzano.gray:stream-line-column s))
 
 (defvar *circularity-hash-table* nil
-  "Contains hash table used for locating circularities, or a stack.")
+  "Contains hash table used for locating circularities")
 ;When an entry is first made it is zero.
 ;If a duplicate is found, a positive integer tag is assigned.
 ;After the first time the object is printed out, the tag is negated.
 
-;; circularity-hash-tables cache freed because thread safety.
-
 (defun get-circularity-hash-table ()
   (make-hash-table :test 'eq))
 
-;If you call this, then the table gets efficiently recycled.
-
-(defun free-circularity-hash-table (table)
-  (declare (ignore table)))
-
 ;                       ---- DISPATCHING ----
 
+;; FIXME: This needs locking, not just the hash-tables but also for others.
 (defclass pprint-dispatch-table ()
   ((conses-with-cars :initarg :conses-with-cars :accessor conses-with-cars)
    (structures :initarg :structures :accessor structures)
    (others :initarg :others :accessor others))
   (:default-initargs
-   :conses-with-cars (make-hash-table :test #'eq)
-   :structures (make-hash-table :test #'eq)
+   :conses-with-cars (make-hash-table :test #'eq :synchronized t)
+   :structures (make-hash-table :test #'eq :synchronized t)
    :others nil))
 
 (defun make-pprint-dispatch (&rest args)
@@ -148,12 +133,12 @@
 
 (defun copy-pprint-dispatch (&optional (table *print-pprint-dispatch*))
   (when (null table) (setf table *IPD*))
-  (let* ((new-conses-with-cars
-           (make-hash-table :test #'eq
-             :size (max (hash-table-count (conses-with-cars table)) 32)))
-         (new-structures
-           (make-hash-table :test #'eq
-             :size (max (hash-table-count (structures table)) 32))))
+  (let* ((new-conses-with-cars (make-hash-table
+                                :test #'eq
+                                :synchronized t))
+         (new-structures (make-hash-table
+                          :test #'eq
+                          :synchronized t)))
     (maphash (lambda (key value)
                  (setf (gethash key new-conses-with-cars) (copy-entry value)))
              (conses-with-cars table))
@@ -317,7 +302,7 @@
 (defconstant +prefix-min-size+ 256)
 (defconstant +suffix-min-size+ 256)
 
-(defclass xp-structure (sys.gray:fundamental-character-output-stream)
+(defclass xp-structure (mezzano.gray:fundamental-character-output-stream)
   ;;The stream IO eventually goes to.
   ((base-stream :initarg :base-stream :accessor base-stream)
    ;;The line length to use for formatting.
@@ -397,7 +382,11 @@
    ;;this stores the suffixes that have to be printed to close of the current
    ;;open blocks.  For convenient in popping, the whole suffix
    ;;is stored in reverse order.
-   (suffix :accessor suffix)))
+   (suffix :accessor suffix)
+
+   ;; Integer if making a first pass over things to identify circularities.
+   ;; Integer used as counter for #n= syntax.
+   (locating-circularities :accessor locating-circularities :initarg :locating-circularities)))
 
 (defmethod print-object ((object xp-structure) stream)
   (print-unreadable-object (object stream :type t :identity t)
@@ -561,7 +550,7 @@
                    (non-blank-prefix-ptr xp) (section-start-line xp))
         (pop-prefix-stack xp)))))
 
-(defmethod initialize-instance :after ((xp xp-structure) &key &allow-other-keys)
+(defmethod initialize-instance :after ((xp xp-structure) &key)
   (setf (linel xp) (max 0 (cond (*print-right-margin*)
                                 ((output-width (base-stream xp)))
                                 (T *default-right-margin*))))
@@ -828,7 +817,7 @@
 ;this can only be called last!
 
 (defun flush (xp)
-  (unless *locating-circularities*
+  (unless (locating-circularities xp)
     (write-string
        (buffer xp) (base-stream xp) :end (buffer-ptr xp)))
   (incf (buffer-offset xp) (buffer-ptr xp))
@@ -854,7 +843,7 @@
       (setf *abbreviation-happened* '*print-lines*)
       (throw 'line-limit-abbreviation-exit T))
     (incf (line-no xp))
-    (unless *locating-circularities*
+    (unless (locating-circularities xp)
       (write-line
           (buffer xp) (base-stream xp) :end end))))
 
@@ -910,7 +899,7 @@
 ;they do not need error checking of fancy stream coercion.  The '++' forms
 ;additionally assume the thing being output does not contain a newline.
 
-(defun sys.int::write-pretty (object stream)
+(defun mezzano.internals::write-pretty (object stream)
   (cond ((xp-structure-p stream) (write+ object stream))
         (*print-pretty* (maybe-initiate-xp-printing
                           (lambda (s o) (write+ o s)) stream object))
@@ -920,86 +909,88 @@
   (if (xp-structure-p stream)
       (apply fn stream args)
       (let ((*abbreviation-happened* nil)
-            (*locating-circularities* (if *print-circle* 0 nil))
             (*circularity-hash-table*
               (if *print-circle* (get-circularity-hash-table) nil))
-            (*parents* (when (not *print-shared*) (list nil)))
             (*result* nil))
         (xp-print fn (decode-stream-arg stream) args)
-        (if *circularity-hash-table*
-            (free-circularity-hash-table *circularity-hash-table*))
         (when *abbreviation-happened*
           (setf *last-abbreviated-printing*
                 (let ((current-package *package*)
                       (copied-args (copy-list args)))
-                  (lambda (&optional (stream ',stream))
+                  (lambda (&optional (stream stream))
                     (let ((*package* current-package))
                       (apply #'maybe-initiate-xp-printing
                              fn stream copied-args))))))
         *result*)))
 
 (defun xp-print (fn stream args)
-  (setf *result* (do-xp-printing fn stream args))
-  (when *locating-circularities*
-    (setf *locating-circularities* nil)
-    (setf *abbreviation-happened* nil)
-    (setf *parents* nil)
-    (setf *result* (do-xp-printing fn stream args))))
+  (when *print-circle*
+    ;; First pass to locate circularities.
+    (setf *result* (do-xp-printing fn stream args 0))
+    (setf *abbreviation-happened* nil))
+  (setf *result* (do-xp-printing fn stream args nil)))
 
 (defun decode-stream-arg (stream)
   (cond ((eq stream T) *terminal-io*)
         ((null stream) *standard-output*)
         (T stream)))
 
-(defun do-xp-printing (fn stream args)
-  (let ((xp (make-instance 'xp-structure :base-stream stream))
+(defun do-xp-printing (fn stream args locating-circularities)
+  (let ((xp (make-instance 'xp-structure
+                           :base-stream stream
+                           :locating-circularities (if locating-circularities
+                                                       0
+                                                       nil)))
         (*current-level* 0)
         (result nil))
     (catch 'line-limit-abbreviation-exit
       (start-block xp nil nil nil)
       (setf result (apply fn xp args))
       (end-block xp nil))
-    (when (and *locating-circularities*
-               (zerop *locating-circularities*) ;No circularities.
+    #++ ; disabled, think this is a performance thing...
+    (when (and (locating-circularities xp)
+               (zerop (locating-circularities xp)) ;No circularities.
                (= (line-no xp) 1)               ;Didn't suppress line.
                (zerop (buffer-offset xp)))      ;Didn't suppress partial line.
-      (setf *locating-circularities* nil))      ;print what you have got.
+      (setf (locating-circularities xp) nil))      ;print what you have got.
     (when (catch 'line-limit-abbreviation-exit
             (attempt-to-output xp nil T) nil)
       (attempt-to-output xp T T))
     result))
 
 (defun write+ (object xp)
-  (let ((*parents* *parents*))
-    (unless (and *circularity-hash-table*
-                (eq (circularity-process xp object nil) :subsequent))
-      (when (and *circularity-hash-table* (consp object))
-        ;;avoid possible double check in handle-logical-block.
-        (setf object (cons (car object) (cdr object))))
-      (let ((printer (if *print-pretty* (get-printer object *print-pprint-dispatch*) nil))
-            type)
-        (cond (printer (funcall printer xp object))
-              ((maybe-print-fast xp object))
-              ((and *print-pretty*
-                    (symbolp (setf type (type-of object)))
-                    (setf printer (get type 'structure-printer))
-                    (not (eq printer :none)))
-               (funcall printer xp object))
-              ((and *print-pretty* *print-array* (arrayp object)
-                    (not (stringp object)) (not (bit-vector-p object))
-                    (not (structure-type-p (type-of object))))
-               (pretty-array xp object))
-              (T (let ((stuff
-                         (with-output-to-string (s)
-                           (non-pretty-print object s))))
-                   (write-string+ stuff xp 0 (length stuff)))))))))
+  (unless (and *circularity-hash-table*
+               (eq (circularity-process xp object nil) :subsequent))
+    (when (and *circularity-hash-table* (consp object))
+      ;;avoid possible double check in handle-logical-block.
+      (setf object (cons (car object) (cdr object))))
+    (let ((printer (if *print-pretty* (get-printer object *print-pprint-dispatch*) nil))
+          #+(or)
+          type)
+      (cond (printer (funcall printer xp object))
+            ((maybe-print-fast xp object))
+            #+(or)
+            ((and *print-pretty*
+                  (symbolp (setf type (type-of object)))
+                  (setf printer (get type 'structure-printer))
+                  (not (eq printer :none)))
+             (funcall printer xp object))
+            ((and *print-pretty* *print-array* (arrayp object)
+                  (not (stringp object)) (not (bit-vector-p object))
+                  (not (structure-type-p (type-of object))))
+             (pretty-array xp object))
+            (T
+             (non-pretty-print object xp))))))
 
 (defun non-pretty-print (object s)
-  (write object
-         :level (if *print-level*
-                    (- *print-level* *current-level*))
-         :pretty nil
-         :stream s))
+  (let ((*print-level* (if *print-level*
+                           (- *print-level* *current-level*)))
+        ;; The original behaviour was to rebind *print-pretty* to nil,
+        ;; but that seemed to be so that the non-pretty-printer would be
+        ;; invoked. Now it is invoked directly and we we don't actually
+        ;; want to disable pretty printing, so leave *print-pretty* alone.
+        #++ (*print-pretty* nil))
+    (mezzano.internals::write-object object s)))
 
 ;It is vital that this function be called EXACTLY once for each occurrence of
 ;  each thing in something being printed.
@@ -1028,17 +1019,14 @@
               (and (symbolp object)     ;Reader takes care of sharing.
                    (or (null *print-gensym*) (symbol-package object))))
     (let ((id (gethash object *circularity-hash-table*)))
-      (if *locating-circularities*
+      (if (locating-circularities xp)
           (cond ((null id)      ;never seen before
-                 (when *parents* (push object *parents*))
                  (setf (gethash object *circularity-hash-table*) 0)
                  nil)
                 ((zerop id) ;possible second occurrence
-                 (cond ((or (null *parents*) (member object *parents*))
-                        (setf (gethash object *circularity-hash-table*)
-                              (incf *locating-circularities*))
-                        :subsequent)
-                       (T nil)))
+                 (setf (gethash object *circularity-hash-table*)
+                       (incf (locating-circularities xp)))
+                 :subsequent)
                 (T :subsequent));third or later occurrence
           (cond ((or (null id)  ;never seen before (note ~@* etc. conses)
                      (zerop id));no duplicates
@@ -1117,22 +1105,22 @@
                           (find c "*+<>-")))
                  (return nil)))))))
 
-(defmethod sys.gray:stream-write-char ((stream xp-structure) char)
+(defmethod mezzano.gray:stream-write-char ((stream xp-structure) char)
   (write-char+ char stream)
   char)
 
-(defmethod sys.gray:stream-write-string ((stream xp-structure) string &optional (start 0) (end (length string)))
-  (write-string+ string stream start end)
+(defmethod mezzano.gray:stream-write-string ((stream xp-structure) string &optional (start 0) end)
+  (write-string+ string stream start (or end (length string)))
   string)
 
-(defmethod sys.gray:stream-terpri ((stream xp-structure))
+(defmethod mezzano.gray:stream-terpri ((stream xp-structure))
   (pprint-newline+ :unconditional stream)
   nil)
 
 ;This has to violate the XP data abstraction and fool with internal
 ;stuff, in order to find out the right info to return as the result.
 
-(defmethod sys.gray:stream-fresh-line ((stream xp-structure))
+(defmethod mezzano.gray:stream-fresh-line ((stream xp-structure))
   (attempt-to-output stream T T) ;ok because we want newline
   (when (not (zerop (LP<-BP stream)))
     (pprint-newline+ :fresh stream)
@@ -1143,20 +1131,23 @@
 ;out.  This is so that things will be in a consistent state if
 ;output continues to the stream later.
 
-(defmethod sys.gray:stream-finish-output ((stream xp-structure))
+(defmethod mezzano.gray:stream-finish-output ((stream xp-structure))
   (attempt-to-output stream T T)
   (finish-output (base-stream stream))
   nil)
 
-(defmethod sys.gray:stream-force-output ((stream xp-structure))
+(defmethod mezzano.gray:stream-force-output ((stream xp-structure))
   (attempt-to-output stream T T)
   (force-output (base-stream stream))
   nil)
 
-(defmethod sys.gray:stream-clear-output ((stream xp-structure))
-  (let ((*locating-circularities* 0)) ;hack to prevent visible output
-    (attempt-to-output stream T T)
-    (clear-output (base-stream stream)))
+(defmethod mezzano.gray:stream-clear-output ((stream xp-structure))
+  (let ((old-l-c (locating-circularities stream)))
+    (unwind-protect
+         (progn (setf (locating-circularities stream) 0) ;hack to prevent visible output
+                (attempt-to-output stream T T)
+                (clear-output (base-stream stream)))
+      (setf (locating-circularities stream) old-l-c)))
   nil)
 
 ;note we are assuming that if a structure is defined using xp::defstruct,
@@ -1226,7 +1217,8 @@
     (setf stream-symbol '*standard-output*))
   (when (and prefix per-line-prefix)
     (warn "prefix ~S and per-line-prefix ~S cannot both be specified ~
-           in PPRINT-LOGICAL-BLOCK")
+           in PPRINT-LOGICAL-BLOCK"
+          prefix per-line-prefix)
     (setf per-line-prefix nil))
   `(maybe-initiate-xp-printing
      (lambda (,stream-symbol)
@@ -1286,7 +1278,6 @@
      (setf circle-check? 'not-first-p))
   `(let ((*current-level* (1+ *current-level*))
          (*current-length* -1)
-         (*parents* *parents*)
          ,@(if (and circle-check? atsign?) `((not-first-p (plusp *current-length*)))))
      (unless (check-block-abbreviation ,var ,args ,circle-check?)
        (block logical-block
@@ -1300,24 +1291,21 @@
 
 (defun pprint-newline (kind &optional (stream *standard-output*))
   (setf stream (decode-stream-arg stream))
-  (when (not (member kind '(:linear :miser :fill :mandatory)))
-    (error "Invalid KIND argument ~A to PPRINT-NEWLINE" kind))
+  (check-type kind (member :linear :miser :fill :mandatory))
   (when (xp-structure-p stream)
     (pprint-newline+ kind stream))
   nil)
 
 (defun pprint-indent (relative-to n &optional (stream *standard-output*))
   (setf stream (decode-stream-arg stream))
-  (when (not (member relative-to '(:block :current)))
-    (error "Invalid KIND argument ~A to PPRINT-INDENT" relative-to))
+  (check-type relative-to (member :block :current))
   (when (xp-structure-p stream)
     (pprint-indent+ relative-to n stream))
   nil)
 
 (defun pprint-tab (kind colnum colinc &optional (stream *standard-output*))
   (setf stream (decode-stream-arg stream))
-  (when (not (member kind '(:line :section :line-relative :section-relative)))
-    (error "Invalid KIND argument ~A to PPRINT-TAB" kind))
+  (check-type kind (member :line :section :line-relative :section-relative))
   (when (xp-structure-p stream)
     (pprint-tab+ kind colnum colinc stream))
   nil)
@@ -1341,29 +1329,25 @@
               (write-char++ #\space xp)
               (pprint-newline+ :fill xp))))))
 
-(proclaim '(special *prefix*))
-
 (defun pretty-non-vector (xp array)
   (let* ((bottom (1- (array-rank array)))
          (indices (make-list (1+ bottom) :initial-element 0))
-         (dims (array-dimensions array))
-         (*prefix* (format nil "#~DA(" (1+ bottom))))
-    (labels ((pretty-slice (slice)
-               (pprint-logical-block (xp nil :prefix *prefix* :suffix ")")
+         (dims (array-dimensions array)))
+    (labels ((pretty-slice (slice prefix)
+               (pprint-logical-block (xp nil :prefix prefix :suffix ")")
                  (let ((end (nth slice dims))
                        (spot (nthcdr slice indices))
-                       (i 0)
-                       (*prefix* "("))
+                       (i 0))
                    (when (plusp end)
                      (loop (pprint-pop)
                            (setf (car spot) i)
                            (if (= slice bottom)
                                (write+ (apply #'aref array indices) xp)
-                               (pretty-slice (1+ slice)))
+                               (pretty-slice (1+ slice) "("))
                            (if (= (incf i) end) (return nil))
                            (write-char++ #\space xp)
                            (pprint-newline+ (if (= slice bottom) :fill :linear) xp)))))))
-      (pretty-slice 0))))
+      (pretty-slice 0 (format nil "#~DA(" (1+ bottom))))))
 
 ;Must use pprint-logical-block (no +) in the following three, because they are
 ;exported functions.

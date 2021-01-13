@@ -1,21 +1,23 @@
-;;;; Copyright (c) 2011-2016 Henry Harrington <henry.harrington@gmail.com>
-;;;; This code is licensed under the MIT license.
+;;;; AST objects.
 
-(in-package :sys.c)
-
-;;; AST objects.
+(in-package :mezzano.compiler)
 
 (defclass ast-node ()
-  ((%optimize-qualities :initarg :optimize :accessor ast-optimize))
-  (:default-initargs :optimize '()))
+  ((%optimize-qualities :initarg :optimize :accessor ast-optimize)
+   (%inline-declarations :initarg :inline-declarations :accessor ast-inline-declarations))
+  (:default-initargs :optimize '() :inline-declarations '()))
 
-(defmethod initialize-instance :after ((instance ast-node) &key inherit &allow-other-keys)
+(defmethod initialize-instance :after ((instance ast-node) &key inherit environment)
   (when inherit
     (loop
        for (quality value) on (ast-optimize inherit) by #'cddr
        do (setf (getf (ast-optimize instance) quality)
                 (max value
-                     (getf (ast-optimize instance) quality 0))))))
+                     (getf (ast-optimize instance) quality 0))))
+    (setf (ast-inline-declarations instance) (ast-inline-declarations inherit)))
+  (when environment
+    (setf (ast-optimize instance) (optimize-qualities-in-environment environment))
+    (setf (ast-inline-declarations instance) (inline-qualities-in-environment environment))))
 
 (defclass lambda-information (ast-node)
   ((%name :initarg :name :accessor lambda-information-name)
@@ -30,7 +32,6 @@
    (%allow-other-keys :initarg :allow-other-keys :accessor lambda-information-allow-other-keys)
    (%environment-arg :initarg :environment-arg :accessor lambda-information-environment-arg)
    (%environment-layout :initarg :environment-layout :accessor lambda-information-environment-layout)
-   (%fref-arg :initarg :fref-arg :accessor lambda-information-fref-arg)
    (%closure-arg :initarg :closure-arg :accessor lambda-information-closure-arg)
    (%count-arg :initarg :count-arg :accessor lambda-information-count-arg)
    (%plist :initarg :plist :accessor lambda-information-plist))
@@ -46,7 +47,6 @@
                      :allow-other-keys '()
                      :environment-arg nil
                      :environment-layout nil
-                     :fref-arg nil
                      :closure-arg nil
                      :count-arg nil
                      :plist '()))
@@ -131,6 +131,10 @@
                      :tagbody nil
                      :use-count 0
                      :used-in '()))
+
+(defmethod print-object ((object go-tag) stream)
+  (print-unreadable-object (object stream :type t :identity t)
+    (format stream "~S" (go-tag-name object))))
 
 (defun go-tag-p (object)
   (typep object 'go-tag))
@@ -231,10 +235,6 @@
 (defclass ast-jump-table (ast-node)
   ((%value :initarg :value :accessor value :accessor ast-value)
    (%targets :initarg :targets :accessor targets :accessor ast-targets)))
-
-(defmethod print-object ((object go-tag) stream)
-  (print-unreadable-object (object stream :type t :identity t)
-    (format stream "~S" (go-tag-name object))))
 
 ;;; Deep copying ASTs.
 
@@ -451,9 +451,6 @@
     (when (lambda-information-environment-arg form)
       (setf (lambda-information-environment-arg info)
             (copy-variable (lambda-information-environment-arg form))))
-    (when (lambda-information-fref-arg form)
-      (setf (lambda-information-fref-arg info)
-            (copy-variable (lambda-information-fref-arg form))))
     (when (lambda-information-closure-arg form)
       (setf (lambda-information-closure-arg info)
             (copy-variable (lambda-information-closure-arg form))))
@@ -586,8 +583,6 @@
         (reset-var (third arg))))
     (when (lambda-information-environment-arg form)
       (reset-var (lambda-information-environment-arg form)))
-    (when (lambda-information-fref-arg form)
-      (reset-var (lambda-information-fref-arg form)))
     (when (lambda-information-closure-arg form)
       (reset-var (lambda-information-closure-arg form)))
     (when (lambda-information-count-arg form)
@@ -616,6 +611,14 @@
                                  (lexical-variable-name variable)
                                  variable)
                              (unparse-compiler-form init-form)))
+        ,@(if (some (lambda (x) (and (typep (first x) 'lexical-variable)
+                                     (lexical-variable-dynamic-extent (first x))))
+                    (bindings form))
+              (list `(declare (dynamic-extent ,@(loop for (variable init-form) in (bindings form)
+                                                   when (and (typep variable 'lexical-variable)
+                                                             (lexical-variable-dynamic-extent variable))
+                                                   collect (lexical-variable-name variable)))))
+              '())
         ,(unparse-compiler-form (body form))))
     (ast-multiple-value-bind
      `(multiple-value-bind ,(mapcar #'unparse-compiler-form (bindings form))
@@ -685,10 +688,14 @@
                                                 (unparse-compiler-form suppliedp))))
                            ,@(when (lambda-information-allow-other-keys form)
                                    '(&allow-other-keys))))
-                       (when (lambda-information-fref-arg form)
-                         `(sys.int::&fref ,(unparse-compiler-form (lambda-information-fref-arg form))))
                        (when (lambda-information-closure-arg form)
                          `(sys.int::&closure ,(unparse-compiler-form (lambda-information-closure-arg form))))
                        (when (lambda-information-count-arg form)
                          `(sys.int::&count ,(unparse-compiler-form (lambda-information-count-arg form)))))
+        (declare (sys.int::lambda-name ,(lambda-information-name form))
+                 ,@(when (and (lambda-information-rest-arg form)
+                              (lexical-variable-dynamic-extent (lambda-information-rest-arg form)))
+                         `((dynamic-extent ,(unparse-compiler-form (lambda-information-rest-arg form)))))
+                 ,@(when (ast-optimize form)
+                     `((optimize ,@(ast-optimize form)))))
         ,(unparse-compiler-form (lambda-information-body form))))))

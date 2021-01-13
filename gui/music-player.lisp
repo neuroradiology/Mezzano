@@ -1,5 +1,4 @@
-;;;; Copyright (c) 2017 Henry Harrington <henry.harrington@gmail.com>
-;;;; This code is licensed under the MIT license.
+;;;; A simple WAV player
 
 (defpackage :mezzano.gui.music-player
   (:use :cl)
@@ -18,7 +17,8 @@
    (%worker-comm-lock :initarg :comm-lock :reader worker-comm-lock)
    (%worker-comm-cvar :initarg :comm-cvar :reader worker-comm-cvar)))
 
-(defgeneric dispatch-event (viewer event))
+(defgeneric dispatch-event (viewer event)
+  (:method (viewer event) nil))
 
 (defmethod dispatch-event (window (event mezzano.gui.compositor:window-activation-event))
   (setf (mezzano.gui.widgets:activep (frame window)) (mezzano.gui.compositor:state event))
@@ -131,6 +131,7 @@
                                         :comm-lock (mezzano.supervisor:make-mutex "Music player lock")
                                         :comm-cvar (mezzano.supervisor:make-condition-variable "Music player cvar")
                                         :state :playing)))
+            (setf (mezzano.gui.compositor:name window) player)
             (unwind-protect
                  (progn
                    (setf (slot-value player '%audio-thread)
@@ -148,7 +149,7 @@
                        (mezzano.gui.widgets:frame-size frame)
                      (mezzano.gui:bitset :set
                                          (- width left right) (- height top bottom)
-                                         mezzano.gui:*default-background-colour*
+                                         mezzano.gui.theme:*background*
                                          framebuffer left top)
                      (mezzano.gui.widgets:draw-frame frame)
                      (mezzano.gui.compositor:damage-window window

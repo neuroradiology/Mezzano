@@ -1,9 +1,10 @@
-;;;; Copyright (c) 2016 Henry Harrington <henry.harrington@gmail.com>
-;;;; This code is licensed under the MIT license.
-
 ;;;; CLOS User Interface Macros.
 
 (in-package :mezzano.clos)
+
+(defmacro push-on-end (value location)
+  "push-on-end is like push except it uses the other end"
+  `(setf ,location (nconc ,location (list ,value))))
 
 ;;; DEFCLASS.
 
@@ -16,10 +17,20 @@
     (check-type superclass-name (and symbol (not null))))
   (let ((*defclass-slot-names* '())
         (*defclass-options* '()))
-    `(ensure-class ',name
-                   :direct-superclasses ',direct-superclasses
-                   :direct-slots (list ,@(mapcar #'canonicalize-defclass-direct-slot direct-slots))
-                   ,@(mapcan #'canonicalize-defclass-option options))))
+    `(progn
+       (eval-when (:compile-toplevel)
+         (sys.int::%compiler-defclass ',name))
+       (ensure-class ',name
+                     :source-location (lambda () (declare (sys.int::lambda-name (defclass ,name))))
+                     :direct-superclasses ',direct-superclasses
+                     :direct-slots (list ,@(loop
+                                              for slot in direct-slots
+                                              collect (canonicalize-defclass-direct-slot name slot)))
+                     ,@(loop
+                          for option in options
+                          append (canonicalize-defclass-option name option))
+                     ,@(when (not (member :default-initargs *defclass-options*))
+                         '(:direct-default-initargs nil))))))
 
 (eval-when (:compile-toplevel :load-toplevel :execute)
 
@@ -45,7 +56,7 @@
                :format-control "Malformed plist ~S."
                :format-arguments (list plist)))))
 
-(defun canonicalize-defclass-direct-slot (direct-slot)
+(defun canonicalize-defclass-direct-slot (class-name direct-slot)
   (check-type direct-slot (or (and symbol (not null))
                               cons))
   (cond ((symbolp direct-slot)
@@ -82,7 +93,9 @@
                (case sym
                  (:initform
                   (setf initform val
-                        initfunction `#'(lambda () ,val)))
+                        initfunction `#'(lambda ()
+                                          (declare (sys.int::lambda-name (slot-initform ,class-name ,name)))
+                                          ,val)))
                  (:initarg
                   (push val initargs))
                  (:reader
@@ -95,6 +108,11 @@
                  (:documentation
                   (setf documentation val))
                  (t
+                  (when (and (eql sym :type)
+                             (listp val)
+                             (eql (first val) 'quote))
+                    (warn "Type definition for slot ~S of class ~S is quoted. The argument to :TYPE is not evaluated." name class-name)
+                    (setf val (second val)))
                   (let ((existing (assoc sym others)))
                     (when (not existing)
                       (setf existing (cons sym '()))
@@ -118,7 +136,7 @@
                                    `',(reverse values)
                                    `',(first values))))))))
 
-(defun canonicalize-defclass-option (option)
+(defun canonicalize-defclass-option (class-name option)
   (check-type (first option) symbol)
   (when (member (first option) *defclass-options*)
     (error 'sys.int::simple-program-error
@@ -127,7 +145,7 @@
   (push (first option) *defclass-options*)
   (case (first option)
     (:default-initargs
-     `(:direct-default-initargs ,(canonicalize-defclass-default-initargs (rest option))))
+     `(:direct-default-initargs ,(canonicalize-defclass-default-initargs class-name (rest option))))
     (:metaclass
      `(:metaclass ',(second option)))
     (:documentation
@@ -135,7 +153,7 @@
     (t
      `(',(first option) ',(rest option)))))
 
-(defun canonicalize-defclass-default-initargs (initargs)
+(defun canonicalize-defclass-default-initargs (class-name initargs)
   (check-plist initargs)
   (let ((seen-initargs '()))
     (loop
@@ -148,28 +166,36 @@
          (push initarg seen-initargs)))
   `(list ,@(loop
               for (initarg form) on initargs by #'cddr
-              collect `(list ',initarg ',form #'(lambda () ,form)))))
+              collect `(list ',initarg ',form #'(lambda ()
+                                                  (declare (sys.int::lambda-name (default-initarg ,class-name ,initarg)))
+                                                  ,form)))))
 
 )
 
 ;;; DEFGENERIC
 
 (defmacro defgeneric (function-name lambda-list &rest options-and-methods)
-  (let ((methods (remove :method options-and-methods
-                         :key #'first :test-not #'eql))
-        (options (remove :method options-and-methods
-                         :key #'first))
-        (gf (gensym "GF")))
-    `(let ((,gf (ensure-generic-function
-                 ',function-name
-                 :lambda-list ',lambda-list
-                 ,@(loop
-                      for opt in options
-                      append (canonicalize-defgeneric-option opt)))))
-       ,@(loop
-            for meth in methods
-            collect (expand-defgeneric-method function-name meth))
-       ,gf)))
+  (let* ((methods (remove :method options-and-methods
+                          :key #'first :test-not #'eql))
+         (options (remove :method options-and-methods
+                          :key #'first))
+         (gf (gensym "GF"))
+         (egf-form `(ensure-generic-function
+                     ',function-name
+                     :lambda-list ',lambda-list
+                     :source-location (lambda () (declare (sys.int::lambda-name (defgeneric ,function-name))))
+                     ,@(loop
+                          for opt in options
+                          append (canonicalize-defgeneric-option opt)))))
+    ;; Try to keep E-G-F at the top-level, avoids a trip through the compiler
+    ;; when file-compiling.
+    (cond (methods
+           `(let ((,gf ,egf-form))
+              ,@(loop
+                   for meth in methods
+                   collect (expand-defgeneric-method function-name meth))
+              ,gf))
+          (t egf-form))))
 
 (eval-when (:compile-toplevel :load-toplevel :execute)
 
@@ -189,6 +215,9 @@
      `(:declarations ',(rest option)))
     (:method-combination
      `(:method-combination
+       ;; FIXME: This should eventually call FIND-METHOD-COMBINATION with
+       ;; maybe the class-prototype for the GF class. Tricky to arrange
+       ;; from here...
        (resolve-method-combination ',(second option) ,@(cddr option))))
     (:argument-precedence-order
      `(:argument-precedence-order ',(rest option)))
@@ -210,7 +239,7 @@
        :lambda-list ',lambda-list
        :qualifiers ',qualifiers
        :specializers ,(canonicalize-specializers specializers)
-       :function #',function)))
+       :fast-function #',function)))
 
 (eval-when (:compile-toplevel :load-toplevel :execute)
 
@@ -259,48 +288,57 @@
                         for name in (getf ll :required-names)
                         collect (gensym (string name))))
            (optional-args-p (not (endp (getf ll :optional-args))))
+           (key-args-p (member '&key lambda-list))
            (rest-arg (if (or optional-args-p
                              (member '&rest lambda-list)
-                             (member '&key lambda-list))
+                             key-args-p)
                          (gensym "REST")
                          nil))
            (incoming-lambda-list (append req-args
                                          (if rest-arg
                                              `(&rest ,rest-arg)
-                                             `()))))
-      `(lambda (method next-emfun)
+                                             `())))
+           (captured-rest (gensym "CNM-REST"))
+           (method (gensym "METHOD"))
+           (next-emfun (gensym "NEXT-EMFUN"))
+           (inner-method-lambda
+            `(lambda ,(kludge-arglist lambda-list)
+               (declare (ignorable ,@(getf (analyze-lambda-list lambda-list) :required-names))
+                        ,@declares)
+               (flet ((call-next-method (&rest cnm-args)
+                        (if cnm-args
+                            (if ,next-emfun
+                                (apply ,next-emfun cnm-args)
+                                (apply #'invoke-no-next-method ,method cnm-args))
+                            (if ,next-emfun
+                                ,(cond (rest-arg
+                                        `(apply ,next-emfun ,@req-args ,captured-rest))
+                                       (t
+                                        `(funcall ,next-emfun ,@req-args)))
+                                ,(cond (rest-arg
+                                        `(apply #'invoke-no-next-method ,method ,@req-args ,captured-rest))
+                                       (t
+                                        `(funcall #'invoke-no-next-method ,method ,@req-args))))))
+                      (next-method-p ()
+                        (not (null ,next-emfun))))
+                 ,form))))
+      `(lambda (,method ,next-emfun)
          (lambda ,incoming-lambda-list
-           (declare (sys.int::lambda-name (defmethod ,fn-spec ,@qualifiers ,specializers)))
+           (declare (sys.int::lambda-name (defmethod ,fn-spec ,@qualifiers ,specializers))
+                    ,@(if rest-arg
+                          `((dynamic-extent ,rest-arg))
+                          `()))
            ,@(when docstring (list docstring))
-           (flet ((call-next-method (&rest cnm-args)
-                    (if cnm-args
-                        (if next-emfun
-                            (apply next-emfun cnm-args)
-                            (apply #'invoke-no-next-method method cnm-args))
-                        (if next-emfun
-                            ,(cond (rest-arg
-                                    `(apply next-emfun ,@req-args ,rest-arg))
-                                   (t
-                                    `(funcall next-emfun ,@req-args)))
-                            ,(cond (rest-arg
-                                    `(apply #'invoke-no-next-method method ,@req-args ,rest-arg))
-                                   (t
-                                    `(funcall #'invoke-no-next-method method ,@req-args))))))
-                  (next-method-p ()
-                    (not (null next-emfun))))
+           ;; &rest may be declared dynamic-extent, but this is bad for call-next-method.
+           ;; Provide a non-dx copy of the &rest list for c-n-m in a way that the compiler
+           ;; can eliminate if c-n-m is not used.
+           (let (,@(if rest-arg
+                       `((,captured-rest (copy-list ,rest-arg)))
+                       `()))
              ,(cond (rest-arg
-                     `(apply (lambda ,(kludge-arglist lambda-list)
-                               (declare (ignorable ,@(getf (analyze-lambda-list lambda-list) :required-names))
-                                        ,@declares)
-                               ,form)
-                             ,@req-args
-                             ,rest-arg))
+                     `(apply ,inner-method-lambda ,@req-args ,rest-arg))
                     (t
-                     `(funcall (lambda ,(kludge-arglist lambda-list)
-                                 (declare (ignorable ,@(getf (analyze-lambda-list lambda-list) :required-names))
-                                          ,@declares)
-                                 ,form)
-                               ,@req-args)))))))))
+                     `(funcall ,inner-method-lambda ,@req-args)))))))))
 
 ;;; N.B. The function kludge-arglist is used to pave over the differences
 ;;; between argument keyword compatibility for regular functions versus
